@@ -1,0 +1,872 @@
+#include "vendor/GPS/gps_logger.h"
+#include "core/callbacks.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "core/glog.h"
+#include "managers/gps_manager.h"
+#include "managers/sd_card_manager.h"
+#include "managers/views/terminal_screen.h"
+#include "sys/time.h"
+#include "vendor/GPS/MicroNMEA.h"
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include "ff.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "core/ghostesp_version.h"
+
+static const char *GPS_TAG = "GPS";
+static const char *CSV_TAG = "CSV";
+static const char *CSV_HEADER = "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n";
+
+static bool is_valid_date(const gps_date_t *date);
+
+#define CSV_GPS_BUFFER_SIZE 512
+
+static FILE *csv_file = NULL;
+static char csv_buffer[GPS_BUFFER_SIZE];
+static size_t buffer_offset = 0;
+static char csv_file_path[GPS_MAX_FILE_NAME_LENGTH];
+static char csv_base_name[32] = "wardriving";
+static bool gps_connection_logged = false;
+static SemaphoreHandle_t csv_mutex = NULL;
+static TaskHandle_t csv_flush_task = NULL;
+static bool csv_header_pending_uart = false;
+
+static char csv_pre_header[256];
+static size_t csv_pre_header_len = 0;
+
+static esp_err_t csv_flush_buffer_to_file_unlocked(void);
+
+#define WD_DEDUPE_SIZE 64
+
+typedef struct {
+    uint32_t hash;
+    int8_t best_rssi;
+    uint8_t flags;
+} wd_dedupe_entry_t;
+
+#define WD_FLAG_USED       0x01
+#define WD_FLAG_NAME_EMPTY 0x02
+
+static wd_dedupe_entry_t wd_wifi_dedupe[WD_DEDUPE_SIZE];
+static wd_dedupe_entry_t wd_ble_dedupe[WD_DEDUPE_SIZE];
+static uint8_t wd_wifi_idx = 0;
+static uint8_t wd_ble_idx = 0;
+static uint32_t wd_wifi_unique_logged = 0;
+
+static uint32_t wd_hash_mac(const char *mac) {
+    uint32_t hash = 2166136261u;
+    while (*mac) {
+        char c = *mac++;
+        if (c >= 'a' && c <= 'f') c -= 32;
+        hash ^= (uint8_t)c;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static void csv_escape_field(char *out, size_t out_len, const char *in) {
+    if (out_len == 0) {
+        return;
+    }
+    if (in == NULL) {
+        out[0] = '\0';
+        return;
+    }
+
+    bool need_quotes = false;
+    for (const char *p = in; *p; p++) {
+        if (*p == ',' || *p == '"' || *p == '\n' || *p == '\r') {
+            need_quotes = true;
+            break;
+        }
+    }
+
+    if (!need_quotes) {
+        snprintf(out, out_len, "%s", in);
+        return;
+    }
+
+    size_t o = 0;
+    if (o + 1 < out_len) {
+        out[o++] = '"';
+    }
+    for (const char *p = in; *p && o + 1 < out_len; p++) {
+        if (*p == '"') {
+            if (o + 2 < out_len) {
+                out[o++] = '"';
+                out[o++] = '"';
+            } else {
+                break;
+            }
+        } else {
+            out[o++] = *p;
+        }
+    }
+    if (o + 1 < out_len) {
+        out[o++] = '"';
+    }
+    out[o] = '\0';
+}
+
+static void csv_build_pre_header(void) {
+    char f0[64], f1[64], f2[64], f3[64], f4[64], f5[64], f6[64], f7[64], f8[64], f9[64], f10[64];
+
+    char app_release[64];
+    char release[64];
+    char device[64];
+
+    const char *model_str = "ESP32";
+    const char *board_str = "ESP32";
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+    model_str = "ESP32-C5";
+    board_str = "ESP32-C5";
+#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+    model_str = "ESP32-C6";
+    board_str = "ESP32-C6";
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+    model_str = "ESP32-S3";
+    board_str = "ESP32-S3";
+#elif defined(CONFIG_IDF_TARGET_ESP32S2)
+    model_str = "ESP32-S2";
+    board_str = "ESP32-S2";
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+    model_str = "ESP32";
+    board_str = "ESP32";
+#endif
+
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+    if (CONFIG_BUILD_CONFIG_TEMPLATE[0] != '\0' && strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "unknown_board") != 0) {
+        model_str = CONFIG_BUILD_CONFIG_TEMPLATE;
+        board_str = CONFIG_BUILD_CONFIG_TEMPLATE;
+    }
+#endif
+
+    snprintf(app_release, sizeof(app_release), "appRelease=%s %s", GHOSTESP_NAME, GHOSTESP_VERSION);
+    snprintf(release, sizeof(release), "release=%s", GHOSTESP_VERSION);
+    snprintf(device, sizeof(device), "device=%s", GHOSTESP_NAME);
+
+    csv_escape_field(f0, sizeof(f0), "WigleWifi-1.6");
+    csv_escape_field(f1, sizeof(f1), app_release);
+    {
+        char model[64];
+        snprintf(model, sizeof(model), "model=%s", model_str);
+        csv_escape_field(f2, sizeof(f2), model);
+    }
+    csv_escape_field(f3, sizeof(f3), release);
+    csv_escape_field(f4, sizeof(f4), device);
+    csv_escape_field(f5, sizeof(f5), "display=NONE");
+    {
+        char board[64];
+        snprintf(board, sizeof(board), "board=%s", board_str);
+        csv_escape_field(f6, sizeof(f6), board);
+    }
+    csv_escape_field(f7, sizeof(f7), "brand=GhostESP");
+    csv_escape_field(f8, sizeof(f8), "star=Sol");
+    csv_escape_field(f9, sizeof(f9), "body=3");
+    csv_escape_field(f10, sizeof(f10), "subBody=0");
+
+    int n = snprintf(csv_pre_header,
+                     sizeof(csv_pre_header),
+                     "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                     f0,
+                     f1,
+                     f2,
+                     f3,
+                     f4,
+                     f5,
+                     f6,
+                     f7,
+                     f8,
+                     f9,
+                     f10);
+    if (n < 0) {
+        csv_pre_header[0] = '\0';
+        csv_pre_header_len = 0;
+        return;
+    }
+    if ((size_t)n >= sizeof(csv_pre_header)) {
+        csv_pre_header[sizeof(csv_pre_header) - 2] = '\n';
+        csv_pre_header[sizeof(csv_pre_header) - 1] = '\0';
+        csv_pre_header_len = strlen(csv_pre_header);
+        return;
+    }
+    csv_pre_header_len = (size_t)n;
+}
+
+static wd_dedupe_entry_t *wd_wifi_dedupe_find_mut(uint32_t hash) {
+    for (size_t i = 0; i < WD_DEDUPE_SIZE; i++) {
+        if ((wd_wifi_dedupe[i].flags & WD_FLAG_USED) && wd_wifi_dedupe[i].hash == hash) {
+            return &wd_wifi_dedupe[i];
+        }
+    }
+    return NULL;
+}
+
+static wd_dedupe_entry_t *wd_ble_dedupe_find_mut(uint32_t hash) {
+    for (size_t i = 0; i < WD_DEDUPE_SIZE; i++) {
+        if ((wd_ble_dedupe[i].flags & WD_FLAG_USED) && wd_ble_dedupe[i].hash == hash) {
+            return &wd_ble_dedupe[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *wigle_wifi_capabilities(const char *enc) {
+    if (enc == NULL || enc[0] == '\0') {
+        return "[ESS]";
+    }
+    if (strcmp(enc, "OPEN") == 0) {
+        return "[ESS]";
+    }
+    if (strcmp(enc, "WEP") == 0) {
+        return "[WEP][ESS]";
+    }
+    if (strcmp(enc, "WPA") == 0) {
+        return "[WPA-PSK][ESS]";
+    }
+    if (strcmp(enc, "WPA2") == 0) {
+        return "[WPA2-PSK][ESS]";
+    }
+    if (strcmp(enc, "WPA3") == 0) {
+        return "[WPA3-SAE][ESS]";
+    }
+    if (strcmp(enc, "OWE") == 0) {
+        return "[OWE][ESS]";
+    }
+    return "[ESS]";
+}
+
+bool csv_buffer_has_pending_data(void) {
+    return buffer_offset > 0;
+}
+
+uint32_t csv_get_unique_wifi_ap_count(void) {
+    uint32_t count = 0;
+    if (csv_mutex) xSemaphoreTake(csv_mutex, portMAX_DELAY);
+    count = wd_wifi_unique_logged;
+    if (csv_mutex) xSemaphoreGive(csv_mutex);
+    return count;
+}
+
+size_t csv_get_pending_bytes(void) {
+    size_t pending = 0;
+    if (csv_mutex) xSemaphoreTake(csv_mutex, portMAX_DELAY);
+    pending = buffer_offset;
+    if (csv_mutex) xSemaphoreGive(csv_mutex);
+    return pending;
+}
+
+static void csv_flush_task_fn(void *arg) {
+    for (;;) {
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+        bool gating_template = (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0);
+#else
+        bool gating_template = false;
+#endif
+        vTaskDelay(pdMS_TO_TICKS(gating_template ? 10000 : 2000));
+        csv_flush_buffer_to_file();
+    }
+}
+
+esp_err_t csv_write_header(FILE *f) {
+    if (f == NULL) {
+        csv_header_pending_uart = true;
+        return ESP_OK;
+    } else {
+        if (csv_pre_header_len == 0) {
+            csv_build_pre_header();
+        }
+        size_t pre_len = csv_pre_header_len;
+        size_t hdr_len = strlen(CSV_HEADER);
+        size_t written = fwrite(csv_pre_header, 1, pre_len, f);
+        if (written != pre_len) {
+            return ESP_FAIL;
+        }
+        written = fwrite(CSV_HEADER, 1, hdr_len, f);
+        if (written != hdr_len) {
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
+}
+
+void get_next_csv_file_name(char *file_name_buffer, const char *base_name) {
+    int next_index = get_next_csv_file_index(base_name);
+    snprintf(file_name_buffer, GPS_MAX_FILE_NAME_LENGTH, "/mnt/ghostesp/gps/%s_%d.csv", base_name,
+             next_index);
+}
+
+esp_err_t csv_file_open(const char *base_file_name) {
+    char file_name[GPS_MAX_FILE_NAME_LENGTH];
+
+    csv_build_pre_header();
+
+    // remember base name for later just-in-time open on somethingsomething
+    if (base_file_name && *base_file_name) {
+        strncpy(csv_base_name, base_file_name, sizeof(csv_base_name) - 1);
+        csv_base_name[sizeof(csv_base_name) - 1] = '\0';
+    }
+
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+    bool gating_template = (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0);
+#else
+    bool gating_template = false;
+#endif
+
+    if (sd_card_exists("/mnt/ghostesp/gps")) {
+        get_next_csv_file_name(file_name, base_file_name);
+        strncpy(csv_file_path, file_name, GPS_MAX_FILE_NAME_LENGTH);
+        csv_file = fopen(file_name, "w");
+    } else {
+        // on somethingsomething, we will mount just-in-time during flush
+        if (gating_template) {
+            csv_file = NULL;
+            csv_file_path[0] = '\0';
+        } else {
+            csv_file = NULL;
+        }
+    }
+
+    if (csv_mutex == NULL) {
+        csv_mutex = xSemaphoreCreateMutex();
+    }
+
+    wd_wifi_idx = 0;
+    wd_ble_idx = 0;
+    wd_wifi_unique_logged = 0;
+    memset(wd_wifi_dedupe, 0, sizeof(wd_wifi_dedupe));
+    memset(wd_ble_dedupe, 0, sizeof(wd_ble_dedupe));
+
+    esp_err_t ret = csv_write_header(csv_file);
+    if (ret != ESP_OK) {
+        glog("Failed to write CSV header.");
+        fclose(csv_file);
+        csv_file = NULL;
+        return ret;
+    }
+
+    if (csv_flush_task == NULL) {
+        xTaskCreate(csv_flush_task_fn, "csv_flush", 3072, NULL, 1, &csv_flush_task);
+    }
+
+    if (csv_file) {
+        glog("Streaming CSV buffer to SD card\n");
+    } else {
+        if (gating_template) {
+            glog("CSV buffer will flush to SD via JIT mount (fallback UART)\n");
+        } else {
+            glog("Streaming CSV buffer over UART\n");
+        }
+        // Header will be emitted with the first non-empty flush via csv_flush_buffer_to_file()
+    }
+    return ESP_OK;
+}
+
+esp_err_t csv_write_data_to_buffer(wardriving_data_t *data) {
+    if (!data)
+        return ESP_ERR_INVALID_ARG;
+
+    gps_t *gps = &((esp_gps_t *)nmea_hdl)->parent;
+    if (!gps)
+        return ESP_ERR_INVALID_STATE;
+
+    char timestamp[24];
+    if (!is_valid_date(&gps->date) || gps->tim.hour > 23 || gps->tim.minute > 59 ||
+        gps->tim.second > 59) {
+        ESP_LOGW(GPS_TAG, "Invalid date/time for CSV entry");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
+             gps_get_absolute_year(gps->date.year), gps->date.month, gps->date.day, gps->tim.hour,
+             gps->tim.minute, gps->tim.second);
+
+    static char data_line[CSV_GPS_BUFFER_SIZE];
+    int len;
+    bool count_unique_wifi = false;
+
+    if (csv_mutex) xSemaphoreTake(csv_mutex, portMAX_DELAY);
+
+    if (data->ble_data.is_ble_device) {
+        uint32_t hash = wd_hash_mac(data->ble_data.ble_mac);
+        wd_dedupe_entry_t *entry = wd_ble_dedupe_find_mut(hash);
+        bool name_empty = (data->ble_data.ble_name[0] == '\0');
+        bool should_log = false;
+        if (entry == NULL) {
+            entry = &wd_ble_dedupe[wd_ble_idx];
+            wd_ble_idx = (wd_ble_idx + 1) % WD_DEDUPE_SIZE;
+            entry->hash = hash;
+            entry->flags = WD_FLAG_USED | (name_empty ? WD_FLAG_NAME_EMPTY : 0);
+            entry->best_rssi = (int8_t)data->ble_data.ble_rssi;
+            should_log = true;
+        } else {
+            if ((entry->flags & WD_FLAG_NAME_EMPTY) && !name_empty) {
+                should_log = true;
+                entry->flags &= ~WD_FLAG_NAME_EMPTY;
+            }
+            if (data->ble_data.ble_rssi > entry->best_rssi + 5) {
+                should_log = true;
+                entry->best_rssi = (int8_t)data->ble_data.ble_rssi;
+            }
+        }
+
+        if (!should_log) {
+            if (csv_mutex) xSemaphoreGive(csv_mutex);
+            return ESP_OK;
+        }
+
+        char name_esc[96];
+        char caps_esc[64];
+        csv_escape_field(name_esc, sizeof(name_esc), data->ble_data.ble_name);
+        csv_escape_field(caps_esc, sizeof(caps_esc), "Misc [LE]");
+
+        char mfgr_str[12] = {0};
+        if (data->ble_data.ble_has_mfgr_id) {
+            snprintf(mfgr_str, sizeof(mfgr_str), "%u", (unsigned)data->ble_data.ble_mfgr_id);
+        }
+
+        len = snprintf(data_line,
+                       CSV_GPS_BUFFER_SIZE,
+                       "%s,%s,%s,%s,0,,%d,%.6f,%.6f,%d,%.1f,,%s,BLE\n",
+                       data->ble_data.ble_mac,
+                       name_esc,
+                       caps_esc,
+                       timestamp,
+                       data->ble_data.ble_rssi,
+                       data->latitude,
+                       data->longitude,
+                       (int)lround(data->altitude),
+                       data->accuracy,
+                       mfgr_str);
+    } else {
+        uint32_t hash = wd_hash_mac(data->bssid);
+        wd_dedupe_entry_t *entry = wd_wifi_dedupe_find_mut(hash);
+        bool ssid_empty = (data->ssid[0] == '\0');
+        bool should_log = false;
+        if (entry == NULL) {
+            entry = &wd_wifi_dedupe[wd_wifi_idx];
+            wd_wifi_idx = (wd_wifi_idx + 1) % WD_DEDUPE_SIZE;
+            entry->hash = hash;
+            entry->flags = WD_FLAG_USED | (ssid_empty ? WD_FLAG_NAME_EMPTY : 0);
+            entry->best_rssi = (int8_t)data->rssi;
+            count_unique_wifi = true;
+            should_log = true;
+        } else {
+            if ((entry->flags & WD_FLAG_NAME_EMPTY) && !ssid_empty) {
+                should_log = true;
+                entry->flags &= ~WD_FLAG_NAME_EMPTY;
+            }
+            if (data->rssi > entry->best_rssi + 5) {
+                should_log = true;
+                entry->best_rssi = (int8_t)data->rssi;
+            }
+        }
+
+        if (!should_log) {
+            if (csv_mutex) xSemaphoreGive(csv_mutex);
+            return ESP_OK;
+        }
+
+        int frequency;
+        if (data->channel == 14) {
+            frequency = 2484;
+        } else if (data->channel > 14) {
+            frequency = 5000 + (data->channel * 5);
+        } else {
+            frequency = 2407 + (data->channel * 5);
+        }
+
+        char ssid_esc[96];
+        char caps_esc[96];
+        csv_escape_field(ssid_esc, sizeof(ssid_esc), data->ssid);
+        csv_escape_field(caps_esc, sizeof(caps_esc), wigle_wifi_capabilities(data->encryption_type));
+
+        len = snprintf(data_line,
+                       CSV_GPS_BUFFER_SIZE,
+                       "%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,%d,%.1f,,,WIFI\n",
+                       data->bssid,
+                       ssid_esc,
+                       caps_esc,
+                       timestamp,
+                       data->channel,
+                       frequency,
+                       data->rssi,
+                       data->latitude,
+                       data->longitude,
+                       (int)lround(data->altitude),
+                       data->accuracy);
+    }
+
+    if (len < 0 || len >= CSV_GPS_BUFFER_SIZE) {
+        ESP_LOGE(CSV_TAG, "Buffer overflow prevented");
+        if (csv_mutex) xSemaphoreGive(csv_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (buffer_offset + len >= GPS_BUFFER_SIZE) {
+        esp_err_t err = csv_flush_buffer_to_file_unlocked();
+        if (err != ESP_OK) {
+            if (csv_mutex) xSemaphoreGive(csv_mutex);
+            return err;
+        }
+        buffer_offset = 0;
+    }
+
+    if (csv_file == NULL && csv_header_pending_uart && buffer_offset == 0) {
+        size_t pre_len = csv_pre_header_len;
+        size_t hdr_len = strlen(CSV_HEADER);
+        if (pre_len + hdr_len < GPS_BUFFER_SIZE) {
+            memcpy(csv_buffer, csv_pre_header, pre_len);
+            memcpy(csv_buffer + pre_len, CSV_HEADER, hdr_len);
+            buffer_offset = pre_len + hdr_len;
+            csv_header_pending_uart = false;
+        }
+    }
+
+    memcpy(csv_buffer + buffer_offset, data_line, len);
+    buffer_offset += len;
+
+    if (count_unique_wifi) {
+        wd_wifi_unique_logged++;
+    }
+
+    if (csv_mutex) xSemaphoreGive(csv_mutex);
+
+    return ESP_OK;
+}
+
+esp_err_t csv_flush_buffer_to_file() {
+    if (csv_mutex) xSemaphoreTake(csv_mutex, portMAX_DELAY);
+    esp_err_t ret = csv_flush_buffer_to_file_unlocked();
+    if (csv_mutex) xSemaphoreGive(csv_mutex);
+    return ret;
+}
+
+static esp_err_t csv_flush_buffer_to_file_unlocked(void) {
+    if (buffer_offset == 0) {
+        return ESP_OK;
+    }
+
+    if (csv_file == NULL) {
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+        bool gating_template = (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0);
+#else
+        bool gating_template = false;
+#endif
+
+        if (gating_template) {
+            bool display_was_suspended = false;
+            esp_err_t mret = sd_card_mount_for_flush(&display_was_suspended);
+            if (mret == ESP_OK) {
+                // lazily choose file name on first flush if not set
+                if (csv_file_path[0] == '\0') {
+                    get_next_csv_file_name(csv_file_path, csv_base_name);
+                }
+                FILE *f = fopen(csv_file_path, "ab+");
+                if (f) {
+                    // if new file (size 0), write header
+                    fseek(f, 0, SEEK_END);
+                    long sz = ftell(f);
+                    size_t pre_len = csv_pre_header_len;
+                    size_t hdr_len = strlen(CSV_HEADER);
+                    bool buffer_has_header =
+                        (buffer_offset >= (pre_len + hdr_len)) &&
+                        (pre_len > 0) &&
+                        (memcmp(csv_buffer, csv_pre_header, pre_len) == 0) &&
+                        (memcmp(csv_buffer + pre_len, CSV_HEADER, hdr_len) == 0);
+                    if (sz == 0 && !buffer_has_header) {
+                        csv_write_header(f);
+                    }
+                    size_t written = fwrite(csv_buffer, 1, buffer_offset, f);
+                    fclose(f);
+                    if (written != buffer_offset) {
+                        glog("Failed to write buffer to file.\n");
+                    } else {
+                        glog("Flushed %zu bytes to CSV file.\n", buffer_offset);
+                        buffer_offset = 0;
+                    }
+                }
+                sd_card_unmount_after_flush(display_was_suspended);
+                return ESP_OK;
+            }
+        }
+
+        glog_set_defer(1);
+        glog("Streaming CSV buffer over UART\n");
+        const char *mark_begin = "[BUF/BEGIN]";
+        const char *mark_close = "[BUF/CLOSE]";
+        size_t mark_begin_len = strlen(mark_begin);
+        size_t mark_close_len = strlen(mark_close);
+        size_t header_len = csv_header_pending_uart ? (csv_pre_header_len + strlen(CSV_HEADER)) : 0;
+        size_t out_len = mark_begin_len + header_len + buffer_offset + mark_close_len + 1;
+        uint8_t *out = (uint8_t *)malloc(out_len);
+        if (out) {
+            size_t off = 0;
+            memcpy(out + off, mark_begin, mark_begin_len); off += mark_begin_len;
+            if (csv_header_pending_uart) {
+                size_t pre_len = csv_pre_header_len;
+                size_t hdr_len = strlen(CSV_HEADER);
+                memcpy(out + off, csv_pre_header, pre_len); off += pre_len;
+                memcpy(out + off, CSV_HEADER, hdr_len); off += hdr_len;
+                csv_header_pending_uart = false;
+            }
+            memcpy(out + off, csv_buffer, buffer_offset); off += buffer_offset;
+            memcpy(out + off, mark_close, mark_close_len); off += mark_close_len;
+            out[off++] = '\n';
+            uart_write_bytes(UART_NUM_0, (const char *)out, off);
+            free(out);
+        } else {
+            uart_write_bytes(UART_NUM_0, mark_begin, mark_begin_len);
+            if (csv_header_pending_uart) {
+                uart_write_bytes(UART_NUM_0, csv_pre_header, csv_pre_header_len);
+                uart_write_bytes(UART_NUM_0, CSV_HEADER, strlen(CSV_HEADER));
+                csv_header_pending_uart = false;
+            }
+            uart_write_bytes(UART_NUM_0, csv_buffer, buffer_offset);
+            uart_write_bytes(UART_NUM_0, mark_close, mark_close_len);
+            uart_write_bytes(UART_NUM_0, "\n", 1);
+        }
+        glog_set_defer(0);
+        glog_flush_deferred();
+
+        buffer_offset = 0;
+        return ESP_OK;
+    }
+
+    size_t written = fwrite(csv_buffer, 1, buffer_offset, csv_file);
+    if (written != buffer_offset) {
+        glog("Failed to write buffer to file.\n");
+        return ESP_FAIL;
+    }
+
+    glog("Flushed %zu bytes to CSV file.\n", buffer_offset);
+    buffer_offset = 0;
+
+    return ESP_OK;
+}
+
+void csv_file_close() {
+    if (csv_file != NULL) {
+        if (csv_flush_task != NULL) {
+            vTaskDelete(csv_flush_task);
+            csv_flush_task = NULL;
+        }
+        if (buffer_offset > 0) {
+            glog("Flushing remaining buffer before closing file.\n");
+            csv_flush_buffer_to_file();
+        }
+        fclose(csv_file);
+        csv_file = NULL;
+        if (csv_mutex != NULL) {
+            vSemaphoreDelete(csv_mutex);
+            csv_mutex = NULL;
+        }
+        if (csv_file_path[0] != '\0') {
+            gps_t *gps = &((esp_gps_t *)nmea_hdl)->parent;
+            const char *mount = "/mnt";
+            const char *rel_path = csv_file_path + strlen(mount);
+            if (*rel_path == '/') rel_path++;
+            FILINFO finfo;
+            if (f_stat(rel_path, &finfo) == FR_OK) {
+                uint16_t year = gps_get_absolute_year(gps->date.year);
+                finfo.fdate = ((year - 1980) << 9) | (gps->date.month << 5) | gps->date.day;
+                finfo.ftime = (gps->tim.hour << 11) | (gps->tim.minute << 5) | (gps->tim.second / 2);
+                f_utime(rel_path, &finfo);
+            }
+        }
+        glog("CSV file closed.\n");
+    }
+}
+
+static bool is_valid_date(const gps_date_t *date) {
+    if (!date)
+        return false;
+
+    // Check year (0-99 represents 2000-2099)
+    if (!gps_is_valid_year(date->year))
+        return false;
+
+    // Check month (1-12)
+    if (date->month < 1 || date->month > 12)
+        return false;
+
+    // Check day (1-31 depending on month)
+    uint8_t days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+    // Adjust February for leap years
+    uint16_t absolute_year = gps_get_absolute_year(date->year);
+    if ((absolute_year % 4 == 0 && absolute_year % 100 != 0) || (absolute_year % 400 == 0)) {
+        days_in_month[1] = 29;
+    }
+
+    if (date->day < 1 || date->day > days_in_month[date->month - 1])
+        return false;
+
+    return true;
+}
+
+void populate_gps_quality_data(wardriving_data_t *data, const gps_t *gps) {
+    if (!data || !gps)
+        return;
+
+    data->gps_quality.satellites_used = gps->sats_in_use;
+    data->gps_quality.hdop = gps->dop_h;
+    data->gps_quality.speed = gps->speed;
+    data->gps_quality.course = gps->cog;
+    data->gps_quality.fix_quality = gps->fix;
+    data->gps_quality.magnetic_var = gps->variation;
+    data->gps_quality.has_valid_fix = gps->valid;
+
+    // Calculate accuracy (existing method)
+    data->accuracy = gps->dop_h * 5.0;
+
+    // Copy basic GPS data (existing fields)
+    data->latitude = gps->latitude;
+    data->longitude = gps->longitude;
+    data->altitude = gps->altitude;
+}
+
+const char *get_gps_quality_string(const wardriving_data_t *data) {
+    if (!data->gps_quality.has_valid_fix) {
+        return "No Fix";
+    }
+
+    if (data->gps_quality.hdop <= 1.0) {
+        return "Excellent";
+    } else if (data->gps_quality.hdop <= 2.0) {
+        return "Good";
+    } else if (data->gps_quality.hdop <= 5.0) {
+        return "Moderate";
+    } else if (data->gps_quality.hdop <= 10.0) {
+        return "Fair";
+    } else {
+        return "Poor";
+    }
+}
+
+static const char *get_cardinal_direction(float course) {
+    const char *directions[] = {"N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                                "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"};
+    int index = (int)((course + 11.25f) / 22.5f) % 16;
+    return directions[index];
+}
+
+static const char *get_fix_type_str(uint8_t fix) {
+    switch (fix) {
+    case GPS_FIX_INVALID:
+        return "No Fix";
+    case GPS_FIX_GPS:
+        return "GPS";
+    case GPS_FIX_DGPS:
+        return "DGPS";
+    default:
+        return "Unknown";
+    }
+}
+
+static void format_coordinates(double lat, double lon, char *lat_str, char *lon_str) {
+    int lat_deg = (int)fabs(lat);
+    double lat_min = (fabs(lat) - lat_deg) * 60;
+    int lon_deg = (int)fabs(lon);
+    double lon_min = (fabs(lon) - lon_deg) * 60;
+
+    sprintf(lat_str, "%ddeg %.4f'%c", lat_deg, lat_min, lat >= 0 ? 'N' : 'S');
+    sprintf(lon_str, "%ddeg %.4f'%c", lon_deg, lon_min, lon >= 0 ? 'E' : 'W');
+}
+
+float get_accuracy_percentage(float hdop) {
+    // HDOP ranges from 1 (best) to 20+ (worst)
+    // Let's consider HDOP of 1 as 100% and HDOP of 20 as 0%
+
+    if (hdop <= 1.0f)
+        return 100.0f;
+    if (hdop >= 20.0f)
+        return 0.0f;
+
+    // Linear interpolation between 1 and 20
+    return (20.0f - hdop) * (100.0f / 19.0f);
+}
+
+void gps_info_display_task(void *pvParameters) {
+    const TickType_t delay = pdMS_TO_TICKS(5000);
+    static char output_buffer[256] = {0};
+    char lat_str[20] = {0}, lon_str[20] = {0};
+    static wardriving_data_t gps_data = {0};
+    while (1) {
+        // Add null check for nmea_hdl
+        if (!nmea_hdl) {
+            if (gps_connection_logged) {
+                glog("GPS Module Disconnected\n");
+                gps_connection_logged = false;
+            }
+            vTaskDelay(delay);
+            continue;
+        }
+
+        gps_t *gps = &((esp_gps_t *)nmea_hdl)->parent;
+
+        if (!gps) {
+            if (gps_connection_logged) {
+                glog("GPS Module Disconnected\n");
+                gps_connection_logged = false;
+            }
+            vTaskDelay(delay);
+            continue;
+        }
+
+        if (!gps->valid || gps->fix < GPS_FIX_GPS || gps->fix_mode < GPS_MODE_2D ||
+            gps->sats_in_use < 3 || gps->sats_in_use > GPS_MAX_SATELLITES_IN_USE) {
+            if (!gps_is_timeout_detected()) {
+                printf("Searching satellites...\nSats: %d/%d\n",
+                       gps->sats_in_use > GPS_MAX_SATELLITES_IN_USE ? 0 : gps->sats_in_use,
+                       GPS_MAX_SATELLITES_IN_USE);
+                TERMINAL_VIEW_ADD_TEXT(
+                    "Searching satellites...\nSats: %d/%d\n",
+                    gps->sats_in_use > GPS_MAX_SATELLITES_IN_USE ? 0 : gps->sats_in_use,
+                    GPS_MAX_SATELLITES_IN_USE);
+            }
+        } else {
+            // Only populate GPS data if we have a valid fix
+            populate_gps_quality_data(&gps_data, gps);
+            format_coordinates(gps_data.latitude, gps_data.longitude, lat_str, lon_str);
+            const char *direction = get_cardinal_direction(gps_data.gps_quality.course);
+
+            printf("GPS Info\n"
+                   "Fix: %s\n"
+                   "Sats: %d/%d\n"
+                   "Lat: %s\n"
+                   "Long: %s\n"
+                   "Alt: %.1fm\n"
+                   "Speed: %.1f km/h\n"
+                   "Direction: %d° %s\n"
+                   "HDOP: %.1f\n",
+                   gps->fix_mode == GPS_MODE_3D ? "3D" : "2D", gps_data.gps_quality.satellites_used,
+                   GPS_MAX_SATELLITES_IN_USE, lat_str, lon_str, gps->altitude,
+                   gps->speed * 3.6, // Convert m/s to km/h
+                   (int)gps_data.gps_quality.course, direction ? direction : "Unknown", gps->dop_h);
+
+            TERMINAL_VIEW_ADD_TEXT(
+                "GPS Info\n"
+                "Fix: %s\n"
+                "Sats: %d/%d\n"
+                "Lat: %s\n"
+                "Long: %s\n"
+                "Alt: %.1fm\n"
+                "Speed: %.1f km/h\n"
+                "Direction: %d° %s\n"
+                "HDOP: %.1f\n",
+                gps->fix_mode == GPS_MODE_3D ? "3D" : "2D", gps_data.gps_quality.satellites_used,
+                GPS_MAX_SATELLITES_IN_USE, lat_str, lon_str, gps->altitude, gps->speed * 3.6,
+                (int)gps_data.gps_quality.course, direction ? direction : "Unknown", gps->dop_h);
+        }
+
+        vTaskDelay(delay);
+    }
+}
