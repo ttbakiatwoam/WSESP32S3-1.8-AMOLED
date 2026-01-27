@@ -35,3 +35,4 @@ dependencies.lock
 venv
 /docs/banshee-docs
 .DS_Store
+Repo-References
