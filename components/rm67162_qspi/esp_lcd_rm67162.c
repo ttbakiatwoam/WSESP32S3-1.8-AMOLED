@@ -98,7 +98,7 @@ esp_err_t esp_lcd_new_panel_rm67162(void *qspi_ctx,
     rm67162->height = 448;  // Waveshare 1.8" AMOLED height
     rm67162->x_gap = 0;
     rm67162->y_gap = 0;
-    rm67162->madctl_val = 0;
+    rm67162->madctl_val = 0x00;  // BGR mode for correct color order
     rm67162->colmod_val = COLMOD_16BPP;  // Default to 16bpp
 
     rm67162->base.del = panel_rm67162_del;
