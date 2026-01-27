@@ -81,23 +81,14 @@ static char image_paths[MAX_IMAGES][MAX_PATH_LEN];
 static int num_images = 0;
 static int current_image = 0;
 
-// Color definitions (RGB565) - fallback when no SD card
-static const uint16_t colors[] = {
-    0xF800, // Red
-    0x07E0, // Green
-    0x001F, // Blue
-    0xFFFF, // White
-    0xF81F, // Magenta
-    0x07FF, // Cyan
-    0xFFE0, // Yellow
-};
-static const char *color_names[] = {"RED", "GREEN", "BLUE", "WHITE", "MAGENTA", "CYAN", "YELLOW"};
-#define NUM_COLORS (sizeof(colors) / sizeof(colors[0]))
-
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static uint16_t *draw_buffer = NULL;
 static sdmmc_card_t *sd_card = NULL;
 static bool use_images = false;
+static bool sd_mounted = false;
+static cst816t_handle_t global_touch_handle = NULL;  // For GIF animation touch detection
+static bool stop_animation = false;
+static bool animation_running = false;
 
 // TCA9554 register addresses
 #define TCA9554_REG_OUTPUT   0x01
@@ -634,7 +625,7 @@ static esp_err_t display_gif(const char *path)
         return ESP_FAIL;
     }
     
-    ESP_LOGI(TAG, "GIF size: %dx%d, colors: %d", gif->width, gif->height, gif->palette->size);
+    ESP_LOGI(TAG, "GIF size: %dx%d, colors: %d, frames: %d", gif->width, gif->height, gif->palette->size, gif->nframes);
     
     // Allocate frame buffer (RGB888) - try PSRAM first
     size_t frame_size = gif->width * gif->height * 3;
@@ -648,25 +639,51 @@ static esp_err_t display_gif(const char *path)
         return ESP_ERR_NO_MEM;
     }
     
-    // Get first frame
-    int ret = gd_get_frame(gif);
-    if (ret <= 0) {
-        ESP_LOGE(TAG, "Failed to get GIF frame: %d", ret);
-        free(frame);
-        gd_close_gif(gif);
-        return ESP_FAIL;
+    // Animate GIF
+    animation_running = true;
+    stop_animation = false;
+    
+    while (!stop_animation) {
+        // Get frame
+        int ret = gd_get_frame(gif);
+        if (ret <= 0) {
+            // Loop back to start
+            gd_rewind(gif);
+            ret = gd_get_frame(gif);
+            if (ret <= 0) break;
+        }
+        
+        // Render frame to buffer
+        gd_render_frame(gif, frame);
+        
+        // Scale and draw to display
+        scale_and_draw_rgb888(frame, gif->width, gif->height);
+        
+        // Wait for frame delay, but check for touch every 20ms
+        uint32_t delay_ms = gif->gce.delay ? gif->gce.delay * 10 : 100;  // GIF delay is in centiseconds
+        uint32_t elapsed = 0;
+        
+        while (elapsed < delay_ms && !stop_animation) {
+            // Check for touch event during GIF animation
+            if (global_touch_handle) {
+                cst816t_touch_data_t touch_data;
+                esp_err_t touch_ret = cst816t_read_touch(global_touch_handle, &touch_data);
+                if (touch_ret == ESP_OK && touch_data.event != 0) {
+                    stop_animation = true;
+                    break;
+                }
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(20));
+            elapsed += 20;
+        }
     }
     
-    // Render frame to buffer
-    gd_render_frame(gif, frame);
-    
-    // Scale and draw to display
-    scale_and_draw_rgb888(frame, gif->width, gif->height);
-    
+    animation_running = false;
     free(frame);
     gd_close_gif(gif);
     
-    ESP_LOGI(TAG, "GIF decoded successfully (first frame)");
+    ESP_LOGI(TAG, "GIF animation finished");
     return ESP_OK;
 }
 
@@ -744,13 +761,59 @@ static esp_err_t init_sd_card(void)
     
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
+        sd_mounted = false;
         return ret;
     }
     
+    sd_mounted = true;
     ESP_LOGI(TAG, "SD card mounted!");
     sdmmc_card_print_info(stdout, sd_card);
     
     return ESP_OK;
+}
+
+static void unmount_sd_card(void)
+{
+    if (sd_mounted) {
+        ESP_LOGI(TAG, "Unmounting SD card...");
+        esp_vfs_fat_sdcard_unmount(MOUNT_POINT, sd_card);
+        sd_card = NULL;
+        sd_mounted = false;
+        use_images = false;
+        num_images = 0;
+        current_image = 0;
+        fill_screen_color(0x07E0);  // Show green immediately to confirm unmount
+        ESP_LOGI(TAG, "SD card unmounted - safe to remove");
+    }
+}
+
+static void remount_sd_card(void)
+{
+    ESP_LOGI(TAG, "Attempting to remount SD card...");
+    
+    // Clear screen and show status
+    fill_screen_color(0x001F);  // Blue background
+    
+    if (init_sd_card() == ESP_OK) {
+        int found = scan_for_images();
+        if (found > 0) {
+            use_images = true;
+            current_image = 0;
+            
+            ESP_LOGI(TAG, "=========================================");
+            ESP_LOGI(TAG, "  SD card remounted - %d images found!", found);
+            ESP_LOGI(TAG, "=========================================");
+            
+            // Show first image
+            display_image(image_paths[current_image]);
+        } else {
+            ESP_LOGW(TAG, "SD card mounted but no images found");
+            fill_screen_color(0xFFE0);  // Yellow - no images
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to remount SD card");
+        fill_screen_color(0xF800);  // Red - error
+    }
 }
 
 static int scan_for_images(void)
@@ -802,11 +865,8 @@ static void show_next_content(int *color_idx)
         current_image = (current_image + 1) % num_images;
         display_image(image_paths[current_image]);
         ESP_LOGI(TAG, "Image %d/%d: %s", current_image + 1, num_images, image_paths[current_image]);
-    } else {
-        *color_idx = (*color_idx + 1) % NUM_COLORS;
-        ESP_LOGI(TAG, "Color: %s", color_names[*color_idx]);
-        fill_screen_color(colors[*color_idx]);
     }
+    // No color cycling - this is a dedicated image viewer
 }
 
 void app_main(void)
@@ -895,6 +955,9 @@ void app_main(void)
         ESP_LOGW(TAG, "Touch init failed, continuing without touch");
     }
     
+    // Set global touch handle for use in animations
+    global_touch_handle = touch_handle;
+    
     // Initialize SD card
     bool sd_ok = (init_sd_card() == ESP_OK);
     
@@ -904,7 +967,8 @@ void app_main(void)
             use_images = true;
             ESP_LOGI(TAG, "=========================================");
             ESP_LOGI(TAG, "  Found %d images!", found);
-            ESP_LOGI(TAG, "  Touch to cycle through images");
+            ESP_LOGI(TAG, "  Tap: next image | Long press: unmount SD");
+            ESP_LOGI(TAG, "  Double-tap: remount SD card");
             ESP_LOGI(TAG, "=========================================");
             
             current_image = 0;
@@ -913,30 +977,56 @@ void app_main(void)
     }
     
     if (!use_images) {
-        ESP_LOGI(TAG, "No images - using color cycling mode");
-        fill_screen_color(colors[0]);
+        ESP_LOGI(TAG, "No images found on SD card");
+        fill_screen_color(0xFFE0);  // Yellow - no images
     }
     
     bool was_touching = false;
-    int color_idx = 0;
+    uint32_t last_touch_time = 0;
+    uint32_t last_touch_end_time = 0;
+    uint32_t double_tap_window = 400;  // 400ms for double tap
+    uint32_t long_press_threshold = 1500;  // 1.5s for long press
     
     // Main loop
     while (1) {
         bool touched = false;
+        uint32_t current_time = esp_timer_get_time() / 1000;  // Convert to ms
         
         if (touch_handle) {
             cst816t_touch_data_t touch_data;
             esp_err_t ret = cst816t_read_touch(touch_handle, &touch_data);
-            if (ret == ESP_OK && touch_data.event == 0) {
+            if (ret == ESP_OK && touch_data.event != 0) {  // FIXED: event != 0 detects touch
                 touched = true;
             }
         }
         
+        // Detect single tap (short press then release)
         if (touched && !was_touching) {
-            show_next_content(&color_idx);
+            last_touch_time = current_time;
+        }
+        
+        // Detect release
+        if (!touched && was_touching) {
+            last_touch_end_time = current_time;
+            uint32_t press_duration = last_touch_end_time - last_touch_time;
+            
+            // Single tap: short press (< 1.5s) and not double tapping
+            if (press_duration < long_press_threshold) {
+                show_next_content(NULL);
+            }
+        }
+        
+        // Detect long press (1.5+ seconds)
+        if (touched && (current_time - last_touch_time) >= long_press_threshold) {
+            unmount_sd_card();
+        }
+        
+        // Detect double tap (two taps within 400ms)
+        if (touched && !was_touching && (current_time - last_touch_end_time) < double_tap_window) {
+            remount_sd_card();
         }
         
         was_touching = touched;
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling for responsive detection
     }
 }
