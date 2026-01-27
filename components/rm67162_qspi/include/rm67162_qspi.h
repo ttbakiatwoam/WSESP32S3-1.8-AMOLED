@@ -37,8 +37,8 @@ typedef struct {
 /**
  * @brief Initialize RM67162 QSPI display
  *
- * @param config Pointer to configuration structure
- * @param io_handle Pointer to store the panel IO handle
+ * @param config Pointer to configuration structure  
+ * @param qspi_ctx_out Pointer to store QSPI context (pass to panel driver)
  * @param panel_handle Pointer to store the panel handle
  * @return
  *      - ESP_OK on success
@@ -47,19 +47,31 @@ typedef struct {
  *      - ESP_FAIL if initialization failed
  */
 esp_err_t rm67162_qspi_init(const rm67162_qspi_config_t *config,
-                            esp_lcd_panel_io_handle_t *io_handle,
+                            void **qspi_ctx_out,
                             esp_lcd_panel_handle_t *panel_handle);
 
 /**
  * @brief Deinitialize RM67162 QSPI display
  *
- * @param io_handle Panel IO handle
+ * @param qspi_ctx QSPI context
  * @param panel_handle Panel handle
  * @return
  *      - ESP_OK on success
  */
-esp_err_t rm67162_qspi_deinit(esp_lcd_panel_io_handle_t io_handle,
+esp_err_t rm67162_qspi_deinit(void *qspi_ctx,
                               esp_lcd_panel_handle_t panel_handle);
+
+/**
+ * @brief Send command and parameters via QSPI
+ * @note This is called internally by the panel driver
+ */
+esp_err_t rm67162_qspi_tx_param(void *ctx, uint8_t cmd, const void *param, size_t param_size);
+
+/**
+ * @brief Send color data via QSPI
+ * @note This is called internally by the panel driver
+ */
+esp_err_t rm67162_qspi_tx_color(void *ctx, const void *color, size_t color_size);
 
 #ifdef __cplusplus
 }
