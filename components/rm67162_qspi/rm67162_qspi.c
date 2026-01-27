@@ -105,41 +105,57 @@ static esp_err_t rm67162_qspi_tx_color(rm67162_qspi_ctx_t *ctx, const void *colo
 }
 
 /**
- * @brief Custom panel IO structure for RM67162 QSPI
+ * @brief Panel IO interface for RM67162 QSPI
+ * This structure provides the interface that esp_lcd expects
  */
 typedef struct {
-    esp_lcd_panel_io_t base;
+    esp_err_t (*del)(esp_lcd_panel_io_handle_t io);
+    esp_err_t (*tx_param)(esp_lcd_panel_io_handle_t io, int lcd_cmd, int lcd_cmd_bits, const void *param, size_t param_size);
+    esp_err_t (*tx_color)(esp_lcd_panel_io_handle_t io, int lcd_cmd, int lcd_cmd_bits, const void *color, size_t color_size);
+    esp_err_t (*register_event_callbacks)(esp_lcd_panel_io_handle_t io, const esp_lcd_panel_io_callbacks_t *cbs, void *user_ctx);
+} panel_io_vtable_t;
+
+typedef struct {
+    const panel_io_vtable_t *vtable;
     rm67162_qspi_ctx_t *ctx;
 } rm67162_panel_io_t;
 
-static esp_err_t rm67162_io_del(esp_lcd_panel_io_t *io)
+static esp_err_t rm67162_io_del(esp_lcd_panel_io_handle_t io)
 {
-    rm67162_panel_io_t *panel_io = __containerof(io, rm67162_panel_io_t, base);
-    free(panel_io);
+    if (io) {
+        free(io);
+    }
     return ESP_OK;
 }
 
-static esp_err_t rm67162_io_tx_param(esp_lcd_panel_io_t *io, int lcd_cmd, 
+static esp_err_t rm67162_io_tx_param(esp_lcd_panel_io_handle_t io, int lcd_cmd, 
                                      int lcd_cmd_bits, const void *param, size_t param_size)
 {
-    rm67162_panel_io_t *panel_io = __containerof(io, rm67162_panel_io_t, base);
+    rm67162_panel_io_t *panel_io = (rm67162_panel_io_t *)io;
     return rm67162_qspi_tx_param(panel_io->ctx, (uint8_t)lcd_cmd, param, param_size);
 }
 
-static esp_err_t rm67162_io_tx_color(esp_lcd_panel_io_t *io, int lcd_cmd, 
+static esp_err_t rm67162_io_tx_color(esp_lcd_panel_io_handle_t io, int lcd_cmd, 
                                      int lcd_cmd_bits, const void *color, size_t color_size)
 {
-    rm67162_panel_io_t *panel_io = __containerof(io, rm67162_panel_io_t, base);
+    rm67162_panel_io_t *panel_io = (rm67162_panel_io_t *)io;
     return rm67162_qspi_tx_color(panel_io->ctx, color, color_size);
 }
 
-static esp_err_t rm67162_io_register_event_callbacks(esp_lcd_panel_io_t *io, 
+static esp_err_t rm67162_io_register_event_callbacks(esp_lcd_panel_io_handle_t io, 
                                                      const esp_lcd_panel_io_callbacks_t *cbs, 
                                                      void *user_ctx)
 {
     // Not implemented for now
     return ESP_OK;
 }
+
+static const panel_io_vtable_t rm67162_io_vtable = {
+    .del = rm67162_io_del,
+    .tx_param = rm67162_io_tx_param,
+    .tx_color = rm67162_io_tx_color,
+    .register_event_callbacks = rm67162_io_register_event_callbacks,
+};
 
 esp_err_t rm67162_qspi_init(const rm67162_qspi_config_t *config,
                             esp_lcd_panel_io_handle_t *io_handle,
@@ -218,13 +234,10 @@ esp_err_t rm67162_qspi_init(const rm67162_qspi_config_t *config,
     rm67162_panel_io_t *panel_io = heap_caps_calloc(1, sizeof(rm67162_panel_io_t), MALLOC_CAP_DEFAULT);
     ESP_GOTO_ON_FALSE(panel_io, ESP_ERR_NO_MEM, cleanup_dev, TAG, "no memory for panel IO");
     
+    panel_io->vtable = &rm67162_io_vtable;
     panel_io->ctx = ctx;
-    panel_io->base.del = rm67162_io_del;
-    panel_io->base.tx_param = rm67162_io_tx_param;
-    panel_io->base.tx_color = rm67162_io_tx_color;
-    panel_io->base.register_event_callbacks = rm67162_io_register_event_callbacks;
     
-    *io_handle = &(panel_io->base);
+    *io_handle = (esp_lcd_panel_io_handle_t)panel_io;
     
     ESP_LOGI(TAG, "RM67162 QSPI initialized - %dx%d @ %lu Hz", 
              config->width, config->height, config->pclk_hz);
@@ -247,7 +260,7 @@ esp_err_t rm67162_qspi_deinit(esp_lcd_panel_io_handle_t io_handle,
         return ESP_OK;
     }
     
-    rm67162_panel_io_t *panel_io = __containerof(io_handle, rm67162_panel_io_t, base);
+    rm67162_panel_io_t *panel_io = (rm67162_panel_io_t *)io_handle;
     rm67162_qspi_ctx_t *ctx = panel_io->ctx;
     
     if (ctx) {

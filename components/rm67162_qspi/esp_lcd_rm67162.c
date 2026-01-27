@@ -72,11 +72,11 @@ esp_err_t esp_lcd_new_panel_rm67162(const esp_lcd_panel_io_handle_t io,
                                     esp_lcd_panel_handle_t *ret_panel)
 {
     ESP_RETURN_ON_FALSE(io && panel_dev_config && ret_panel, ESP_ERR_INVALID_ARG, TAG, "invalid arguments");
-    
+
     esp_err_t ret = ESP_OK;
     rm67162_panel_t *rm67162 = calloc(1, sizeof(rm67162_panel_t));
     ESP_RETURN_ON_FALSE(rm67162, ESP_ERR_NO_MEM, TAG, "no mem for rm67162 panel");
-    
+
     if (panel_dev_config->reset_gpio_num >= 0) {
         gpio_config_t io_conf = {
             .pin_bit_mask = 1ULL << panel_dev_config->reset_gpio_num,
@@ -87,7 +87,7 @@ esp_err_t esp_lcd_new_panel_rm67162(const esp_lcd_panel_io_handle_t io,
         };
         ESP_GOTO_ON_ERROR(gpio_config(&io_conf), err, TAG, "configure GPIO for RST failed");
     }
-    
+
     rm67162->io = io;
     rm67162->reset_gpio = panel_dev_config->reset_gpio_num;
     rm67162->reset_level = panel_dev_config->flags.reset_active_high;
@@ -97,7 +97,7 @@ esp_err_t esp_lcd_new_panel_rm67162(const esp_lcd_panel_io_handle_t io,
     rm67162->y_gap = 0;
     rm67162->madctl_val = 0;
     rm67162->colmod_val = COLMOD_16BPP;  // Default to 16bpp
-    
+
     rm67162->base.del = panel_rm67162_del;
     rm67162->base.reset = panel_rm67162_reset;
     rm67162->base.init = panel_rm67162_init;
@@ -107,10 +107,10 @@ esp_err_t esp_lcd_new_panel_rm67162(const esp_lcd_panel_io_handle_t io,
     rm67162->base.mirror = panel_rm67162_mirror;
     rm67162->base.swap_xy = panel_rm67162_swap_xy;
     rm67162->base.disp_on_off = panel_rm67162_disp_on_off;
-    
+
     *ret_panel = &(rm67162->base);
     ESP_LOGI(TAG, "new RM67162 panel @%p", rm67162);
-    
+
     return ESP_OK;
 
 err:
@@ -123,11 +123,11 @@ err:
 static esp_err_t panel_rm67162_del(esp_lcd_panel_t *panel)
 {
     rm67162_panel_t *rm67162 = __containerof(panel, rm67162_panel_t, base);
-    
+
     if (rm67162->reset_gpio >= 0) {
         gpio_reset_pin(rm67162->reset_gpio);
     }
-    
+
     free(rm67162);
     ESP_LOGD(TAG, "del rm67162 panel @%p", rm67162);
     return ESP_OK;
@@ -137,7 +137,7 @@ static esp_err_t panel_rm67162_reset(esp_lcd_panel_t *panel)
 {
     rm67162_panel_t *rm67162 = __containerof(panel, rm67162_panel_t, base);
     esp_lcd_panel_io_handle_t io = rm67162->io;
-    
+
     if (rm67162->reset_gpio >= 0) {
         gpio_set_level(rm67162->reset_gpio, rm67162->reset_level);
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -148,7 +148,7 @@ static esp_err_t panel_rm67162_reset(esp_lcd_panel_t *panel)
         esp_lcd_panel_io_tx_param(io, LCD_CMD_SWRESET, NULL, 0);
         vTaskDelay(pdMS_TO_TICKS(120));
     }
-    
+
     return ESP_OK;
 }
 
@@ -156,48 +156,48 @@ static esp_err_t panel_rm67162_init(esp_lcd_panel_t *panel)
 {
     rm67162_panel_t *rm67162 = __containerof(panel, rm67162_panel_t, base);
     esp_lcd_panel_io_handle_t io = rm67162->io;
-    
+
     // Sleep out
     esp_lcd_panel_io_tx_param(io, LCD_CMD_SLPOUT, NULL, 0);
     vTaskDelay(pdMS_TO_TICKS(120));
-    
+
     // SH8601 specific initialization sequence
     // Switch to HBM mode
     esp_lcd_panel_io_tx_param(io, LCD_CMD_SWITCHMODE, (uint8_t[]){0x20}, 1);
     esp_lcd_panel_io_tx_param(io, 0x63, (uint8_t[]){0xFF}, 1);  // Brightness HBM
     esp_lcd_panel_io_tx_param(io, 0x26, (uint8_t[]){0x0A}, 1);
     esp_lcd_panel_io_tx_param(io, 0x24, (uint8_t[]){0x80}, 1);
-    
+
     // Back to command mode
     esp_lcd_panel_io_tx_param(io, LCD_CMD_SWITCHMODE, (uint8_t[]){0x20}, 1);
     esp_lcd_panel_io_tx_param(io, LCD_CMD_SETSPIMODE, (uint8_t[]){0x80}, 1);   // QSPI MODE
     esp_lcd_panel_io_tx_param(io, LCD_CMD_SETDISPMODE, (uint8_t[]){0x00}, 1);  // DSPI MODE OFF
     vTaskDelay(pdMS_TO_TICKS(10));
-    
+
     esp_lcd_panel_io_tx_param(io, LCD_CMD_WRCTRLD1, (uint8_t[]){0x20}, 1);     // Brightness control ON
     esp_lcd_panel_io_tx_param(io, LCD_CMD_SETTSCANL, (uint8_t[]){0x01, 0xC0}, 2);  // Tear scanline N=448
-    
+
     // Set pixel format
     esp_lcd_panel_io_tx_param(io, LCD_CMD_COLMOD, &rm67162->colmod_val, 1);
-    
+
     // Set brightness minimum
     esp_lcd_panel_io_tx_param(io, LCD_CMD_WRDISBV, (uint8_t[]){0x00}, 1);
-    
+
     // Tearing effect off
     esp_lcd_panel_io_tx_param(io, LCD_CMD_TEON, (uint8_t[]){0x00}, 1);
-    
+
     // Set MADCTL
     esp_lcd_panel_io_tx_param(io, LCD_CMD_MADCTL, &rm67162->madctl_val, 1);
-    
+
     // Display on
     esp_lcd_panel_io_tx_param(io, LCD_CMD_DISPON, NULL, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
-    
+
     // Set brightness to max
     esp_lcd_panel_io_tx_param(io, LCD_CMD_WRDISBV, (uint8_t[]){0xFF}, 1);
-    
+
     ESP_LOGI(TAG, "RM67162 panel initialized");
-    
+
     return ESP_OK;
 }
 
@@ -206,32 +206,32 @@ static esp_err_t panel_rm67162_draw_bitmap(esp_lcd_panel_t *panel, int x_start, 
 {
     rm67162_panel_t *rm67162 = __containerof(panel, rm67162_panel_t, base);
     esp_lcd_panel_io_handle_t io = rm67162->io;
-    
+
     ESP_RETURN_ON_FALSE(x_start < x_end && y_start < y_end, ESP_ERR_INVALID_ARG, TAG, "invalid coordinates");
-    
+
     x_start += rm67162->x_gap;
     x_end += rm67162->x_gap;
     y_start += rm67162->y_gap;
     y_end += rm67162->y_gap;
-    
+
     // Set column address
     uint8_t col_data[] = {
         (x_start >> 8) & 0xFF, x_start & 0xFF,
         ((x_end - 1) >> 8) & 0xFF, (x_end - 1) & 0xFF
     };
     esp_lcd_panel_io_tx_param(io, LCD_CMD_CASET, col_data, 4);
-    
+
     // Set row address
     uint8_t row_data[] = {
         (y_start >> 8) & 0xFF, y_start & 0xFF,
         ((y_end - 1) >> 8) & 0xFF, (y_end - 1) & 0xFF
     };
     esp_lcd_panel_io_tx_param(io, LCD_CMD_RASET, row_data, 4);
-    
+
     // Transfer frame buffer
     size_t len = (x_end - x_start) * (y_end - y_start) * 2;  // 16bpp = 2 bytes per pixel
     esp_lcd_panel_io_tx_color(io, LCD_CMD_RAMWR, color_data, len);
-    
+
     return ESP_OK;
 }
 
@@ -248,19 +248,19 @@ static esp_err_t panel_rm67162_mirror(esp_lcd_panel_t *panel, bool mirror_x, boo
 {
     rm67162_panel_t *rm67162 = __containerof(panel, rm67162_panel_t, base);
     esp_lcd_panel_io_handle_t io = rm67162->io;
-    
+
     if (mirror_x) {
         rm67162->madctl_val |= LCD_CMD_MADCTL_MX;
     } else {
         rm67162->madctl_val &= ~LCD_CMD_MADCTL_MX;
     }
-    
+
     if (mirror_y) {
         rm67162->madctl_val |= LCD_CMD_MADCTL_MY;
     } else {
         rm67162->madctl_val &= ~LCD_CMD_MADCTL_MY;
     }
-    
+
     esp_lcd_panel_io_tx_param(io, LCD_CMD_MADCTL, &rm67162->madctl_val, 1);
     return ESP_OK;
 }
@@ -269,13 +269,13 @@ static esp_err_t panel_rm67162_swap_xy(esp_lcd_panel_t *panel, bool swap_axes)
 {
     rm67162_panel_t *rm67162 = __containerof(panel, rm67162_panel_t, base);
     esp_lcd_panel_io_handle_t io = rm67162->io;
-    
+
     if (swap_axes) {
         rm67162->madctl_val |= LCD_CMD_MADCTL_MV;
     } else {
         rm67162->madctl_val &= ~LCD_CMD_MADCTL_MV;
     }
-    
+
     esp_lcd_panel_io_tx_param(io, LCD_CMD_MADCTL, &rm67162->madctl_val, 1);
     return ESP_OK;
 }
