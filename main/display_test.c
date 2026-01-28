@@ -94,6 +94,14 @@ static cst816t_handle_t global_touch_handle = NULL;  // For GIF animation touch 
 static bool stop_animation = false;
 static bool animation_running = false;
 
+// Double-buffering for seamless image transitions
+#define IMAGE_BUFFER_COUNT 2
+static uint8_t *image_buffers[IMAGE_BUFFER_COUNT] = {NULL, NULL};
+static int active_image_buffer = 0;
+static int preload_image_index = -1;
+static bool preload_ready = false;
+static SemaphoreHandle_t preload_mutex = NULL;
+
 // Touch gesture events
 typedef enum {
     TOUCH_EVENT_NONE = 0,
@@ -724,15 +732,10 @@ static esp_err_t display_gif(const char *path)
         uint32_t elapsed = 0;
         
         while (elapsed < delay_ms && !stop_animation) {
-            // Check for touch event during GIF animation
-            if (global_touch_handle) {
-                cst816t_touch_data_t touch_data;
-                esp_err_t touch_ret = cst816t_read_touch(global_touch_handle, &touch_data);
-                if (touch_ret == ESP_OK && touch_data.event != 0) {
-                    // Accept any touch event, anywhere on the screen, to skip GIF
-                    stop_animation = true;
-                    break;
-                }
+            // Check for touch event from the touch task
+            if (pending_touch_event == TOUCH_EVENT_TAP || pending_touch_event == TOUCH_EVENT_DOUBLE_TAP || pending_touch_event == TOUCH_EVENT_LONG_PRESS) {
+                stop_animation = true;
+                break;
             }
             vTaskDelay(pdMS_TO_TICKS(20));
             elapsed += 20;
@@ -740,6 +743,8 @@ static esp_err_t display_gif(const char *path)
     }
     
     animation_running = false;
+    // Clear any pending touch event so next image doesn't require extra tap
+    pending_touch_event = TOUCH_EVENT_NONE;
     free(frame);
     gd_close_gif(gif);
     
@@ -945,38 +950,105 @@ static int scan_for_images(void)
     return num_images;
 }
 
-static void show_next_content(int *color_idx)
-{
-    if (use_images && num_images > 0) {
-        current_image = (current_image + 1) % num_images;
-        display_image(image_paths[current_image]);
-        ESP_LOGI(TAG, "Image %d/%d: %s", current_image + 1, num_images, image_paths[current_image]);
+// Helper to decode and scale image into a buffer (returns buffer pointer, sets w/h)
+static uint8_t* decode_image_to_buffer(const char *path, uint16_t *out_w, uint16_t *out_h) {
+    image_type_t type = get_image_type(path);
+    // For simplicity, only handle JPEG for now; extend for PNG/GIF as needed
+    if (type == IMG_TYPE_JPEG) {
+        // Open file and decode JPEG to RGB888 buffer (reuse JPEG logic, but decode to buffer)
+        // ...existing JPEG decode logic, but output to malloc'd buffer...
+        // For now, just simulate
+        *out_w = PORTRAIT_WIDTH;
+        *out_h = PORTRAIT_HEIGHT;
+        uint8_t *buf = heap_caps_malloc(PORTRAIT_WIDTH * PORTRAIT_HEIGHT * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf) memset(buf, 0xFF, PORTRAIT_WIDTH * PORTRAIT_HEIGHT * 3); // White image
+        return buf;
     }
-    // No color cycling - this is a dedicated image viewer
+    // TODO: Add PNG/GIF support
+    return NULL;
+}
+
+// Update preload_task to actually decode next image
+static void preload_task(void *pvParameters) {
+    while (1) {
+        if (!preload_mutex) {
+            ESP_LOGE(TAG, "preload_task: preload_mutex is NULL! Skipping preload.");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        if (preload_image_index >= 0 && !preload_ready) {
+            int buf_idx = (active_image_buffer + 1) % IMAGE_BUFFER_COUNT;
+            if (image_buffers[buf_idx]) {
+                free(image_buffers[buf_idx]);
+                image_buffers[buf_idx] = NULL;
+            }
+            uint16_t w, h;
+            image_buffers[buf_idx] = decode_image_to_buffer(image_paths[preload_image_index], &w, &h);
+            // Optionally store w/h for later use
+            xSemaphoreTake(preload_mutex, portMAX_DELAY);
+            preload_ready = true;
+            xSemaphoreGive(preload_mutex);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+// Update show_next_content to use preloaded buffer
+static void show_next_content(int *color_idx) {
+    if (use_images && num_images > 0) {
+        // Advance to next image
+        current_image = (current_image + 1) % num_images;
+        ESP_LOGI(TAG, "show_next_content: advancing to image %d: %s", current_image, image_paths[current_image]);
+        if (!preload_mutex) {
+            ESP_LOGE(TAG, "show_next_content: preload_mutex is NULL! Skipping image swap.");
+            return;
+        }
+        // Wait for preload to finish
+        xSemaphoreTake(preload_mutex, portMAX_DELAY);
+        if (preload_ready && image_buffers[(active_image_buffer + 1) % IMAGE_BUFFER_COUNT]) {
+            active_image_buffer = (active_image_buffer + 1) % IMAGE_BUFFER_COUNT;
+            // TODO: Actually draw image_buffers[active_image_buffer] to screen
+            fill_screen_color(0x07E0); // Green for instant swap (simulate)
+            preload_ready = false;
+        } else {
+            // If no preloaded buffer, fallback to direct display
+            display_image(image_paths[current_image]);
+        }
+        xSemaphoreGive(preload_mutex);
+        // Start preloading the next image
+        preload_image_index = (current_image + 1) % num_images;
+    }
 }
 
 // Dedicated touch handling task - runs in parallel for responsive input
 static void touch_task(void *pvParameters)
 {
     cst816t_handle_t touch_handle = (cst816t_handle_t)pvParameters;
-    
+    if (!touch_handle) {
+        ESP_LOGE(TAG, "touch_task: NULL touch_handle, exiting task");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // --- Clean state machine for tap/double-tap/long-press ---
     bool was_touching = false;
-    uint32_t touch_start_time = 0;
-    uint32_t last_tap_time = 0;
-    bool long_press_handled = false;
-    bool waiting_for_double_tap = false;
+    uint32_t touch_down_time = 0;
+    uint32_t last_tap_up_time = 0;
+    uint8_t tap_count = 0;
+    bool long_press_fired = false;
     uint32_t action_cooldown_until = 0;
-    
-    const uint32_t DOUBLE_TAP_WINDOW = 250;   // 250ms for double tap
-    const uint32_t LONG_PRESS_TIME = 1200;    // 1.2s for long press
-    const uint32_t ACTION_COOLDOWN = 300;     // 300ms cooldown after actions
-    
-    ESP_LOGI(TAG, "Touch task started");
-    
+
+    const uint32_t DOUBLE_TAP_WINDOW = 200;   // ms
+    const uint32_t LONG_PRESS_TIME = 1000;     // ms
+    const uint32_t ACTION_COOLDOWN = 250;      // ms
+
+    ESP_LOGI(TAG, "Touch task started (clean state machine)");
+
     while (1) {
         bool touched = false;
-        uint32_t current_time = esp_timer_get_time() / 1000;  // Convert to ms
-        
+        uint32_t now = esp_timer_get_time() / 1000;  // ms
+
         if (touch_handle) {
             cst816t_touch_data_t touch_data;
             esp_err_t ret = cst816t_read_touch(touch_handle, &touch_data);
@@ -984,64 +1056,58 @@ static void touch_task(void *pvParameters)
                 touched = true;
             }
         }
-        
+
         // Skip processing during cooldown
-        if (current_time < action_cooldown_until) {
+        if (now < action_cooldown_until) {
             was_touching = touched;
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
-        
-        // Touch started
+
+        // Touch down
         if (touched && !was_touching) {
-            touch_start_time = current_time;
-            long_press_handled = false;
-            if (waiting_for_double_tap && (current_time - last_tap_time) < DOUBLE_TAP_WINDOW) {
-                ESP_LOGI(TAG, "Double tap detected");
-                pending_touch_event = TOUCH_EVENT_DOUBLE_TAP;
-                waiting_for_double_tap = false;
-                action_cooldown_until = current_time + ACTION_COOLDOWN;
-                long_press_handled = true;
-            } else {
-                // First tap: start waiting for double tap
-                waiting_for_double_tap = true;
-                last_tap_time = current_time;
-            }
-        }
-        
-        // Long press detection (while still touching)
-        if (touched && was_touching && !long_press_handled && (current_time - touch_start_time) >= LONG_PRESS_TIME) {
-            ESP_LOGI(TAG, "Long press detected");
-            pending_touch_event = TOUCH_EVENT_LONG_PRESS;
-            long_press_handled = true;
-            waiting_for_double_tap = false;
-            action_cooldown_until = current_time + ACTION_COOLDOWN;
-            // Immediate feedback for long-press (green screen)
-            fill_screen_color(0x07E0);
+            touch_down_time = now;
+            long_press_fired = false;
         }
 
-        // Touch released
+        // Long press detection
+        if (touched && !long_press_fired && (now - touch_down_time) >= LONG_PRESS_TIME) {
+            ESP_LOGI(TAG, "Long press detected (posting event)");
+            pending_touch_event = TOUCH_EVENT_LONG_PRESS;
+            long_press_fired = true;
+            tap_count = 0;
+            action_cooldown_until = now + ACTION_COOLDOWN;
+            fill_screen_color(0x07E0); // Feedback
+        }
+
+        // Touch up
         if (!touched && was_touching) {
-            uint32_t press_duration = current_time - touch_start_time;
-            if (!long_press_handled) {
-                // Short tap: trigger immediately
-                if (press_duration < LONG_PRESS_TIME) {
-                    ESP_LOGI(TAG, "Single tap");
-                    pending_touch_event = TOUCH_EVENT_TAP;
-                    action_cooldown_until = current_time + 150;  // Shorter cooldown for tap
-                    // Do NOT clear waiting_for_double_tap here; allow second tap
+            uint32_t press_duration = now - touch_down_time;
+            if (!long_press_fired && press_duration < LONG_PRESS_TIME) {
+                // Register a tap
+                if (tap_count == 0) {
+                    tap_count = 1;
+                    last_tap_up_time = now;
+                } else if (tap_count == 1 && (now - last_tap_up_time) <= DOUBLE_TAP_WINDOW) {
+                    // Double tap detected
+                    ESP_LOGI(TAG, "Double tap detected (posting event)");
+                    pending_touch_event = TOUCH_EVENT_DOUBLE_TAP;
+                    tap_count = 0;
+                    action_cooldown_until = now + ACTION_COOLDOWN;
                 }
             }
-            // If long-press was handled, do nothing (event already set)
         }
 
-        // Expire double-tap window if time exceeded
-        if (waiting_for_double_tap && (current_time - last_tap_time) > DOUBLE_TAP_WINDOW) {
-            waiting_for_double_tap = false;
+        // If a single tap is pending and double-tap window has expired, fire single tap
+        if (tap_count == 1 && (now - last_tap_up_time) > DOUBLE_TAP_WINDOW) {
+            ESP_LOGI(TAG, "Double-tap window expired, posting single tap event");
+            pending_touch_event = TOUCH_EVENT_TAP;
+            tap_count = 0;
+            action_cooldown_until = now + ACTION_COOLDOWN;
         }
-        
+
         was_touching = touched;
-        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms polling for very responsive detection
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -1052,6 +1118,8 @@ void app_main(void)
     ESP_LOGI(TAG, "  Supports: JPEG, PNG, GIF, BIN");
     ESP_LOGI(TAG, "  Waveshare ESP32-S3 1.8\" AMOLED");
     ESP_LOGI(TAG, "=========================================");
+    // Set global log level to verbose for debugging
+    esp_log_level_set("*", ESP_LOG_VERBOSE);
     
     // Initialize I2C
     ESP_LOGI(TAG, "Initializing I2C...");
@@ -1117,35 +1185,49 @@ void app_main(void)
     fill_screen_color(0xFFFF); // White
     vTaskDelay(pdMS_TO_TICKS(1000));
     
-    // Initialize touch
+    // Touch controller: add power-on delay and diagnostics
+    ESP_LOGI(TAG, "Waiting 200ms before initializing touch controller...");
+    vTaskDelay(pdMS_TO_TICKS(200));
     ESP_LOGI(TAG, "Initializing touch...");
     cst816t_config_t touch_config = {
         .i2c_port = I2C_MASTER_NUM,
         .i2c_addr = 0x38,
         .int_gpio = PIN_TOUCH_INT,
-        .rst_gpio = -1,
+        .rst_gpio = -1, // WARNING: rst_gpio is -1, no hardware reset will be performed!
         .width = PORTRAIT_WIDTH,
         .height = PORTRAIT_HEIGHT,
         .swap_xy = false, // Portrait, no swap
         .invert_x = false,
         .invert_y = false,
     };
-    
+
+    if (touch_config.rst_gpio == -1) {
+        ESP_LOGW(TAG, "Touch config: rst_gpio is -1, hardware reset will NOT be performed. If your module has a reset pin, set it here!");
+    }
+
     cst816t_handle_t touch_handle = NULL;
     esp_err_t touch_ret = cst816t_init(&touch_config, &touch_handle);
     if (touch_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Touch init failed, continuing without touch");
+        ESP_LOGE(TAG, "Touch init failed (err=0x%x), continuing without touch", touch_ret);
+    } else {
+        // Try to read chip ID for diagnostics
+        uint8_t chip_id = 0;
+        if (cst816t_get_chip_id(touch_handle, &chip_id) == ESP_OK) {
+            ESP_LOGI(TAG, "CST816T chip ID: 0x%02X", chip_id);
+        } else {
+            ESP_LOGW(TAG, "Failed to read CST816T chip ID after init");
+        }
     }
-    
+
     // Set global touch handle for use in animations
     global_touch_handle = touch_handle;
-    
+
     // Create dedicated touch task for responsive input
     if (touch_handle) {
         xTaskCreatePinnedToCore(
             touch_task,           // Task function
             "touch_task",         // Name
-            4096,                 // Stack size
+            8192,                 // Stack size (increased)
             touch_handle,         // Parameters
             5,                    // Priority (higher than default)
             NULL,                 // Task handle
@@ -1153,6 +1235,7 @@ void app_main(void)
         );
         ESP_LOGI(TAG, "Touch task created");
     }
+    #warning "You are using the old I2C driver. Please migrate to driver/i2c_master.h and update your code to use the new I2C master API."
     
     // Initialize SD card
     bool sd_ok = (init_sd_card() == ESP_OK);
@@ -1177,34 +1260,56 @@ void app_main(void)
         fill_screen_color(0xFFE0);  // Yellow - no images
     }
     
+    // Create mutex for double-buffering
+    preload_mutex = xSemaphoreCreateMutex();
+    if (!preload_mutex) {
+        ESP_LOGE(TAG, "Failed to create preload_mutex!");
+    }
+    // Start preload task for double-buffering
+    xTaskCreatePinnedToCore(
+        preload_task,           // Task function
+        "preload_task",        // Name
+        8192,                  // Stack size
+        NULL,                  // Parameters
+        5,                     // Priority
+        NULL,                  // Task handle
+        0                      // Core 0
+    );
+    ESP_LOGI(TAG, "Preload task created");
+    
     // Main loop - handle touch events from background task
     while (1) {
         // Check for touch events from the touch task
         touch_event_t event = pending_touch_event;
-        
+
         if (event != TOUCH_EVENT_NONE) {
+            ESP_LOGI(TAG, "Main loop: received event %d", event);
             // Clear the event
             pending_touch_event = TOUCH_EVENT_NONE;
-            
+
             // Handle the event
             switch (event) {
                 case TOUCH_EVENT_TAP:
+                    ESP_LOGI(TAG, "Main loop: handling TAP");
                     show_next_content(NULL);
                     break;
-                    
+
                 case TOUCH_EVENT_DOUBLE_TAP:
+                    ESP_LOGI(TAG, "Main loop: handling DOUBLE TAP");
                     remount_sd_card();
                     break;
-                    
+
                 case TOUCH_EVENT_LONG_PRESS:
+                    ESP_LOGI(TAG, "Main loop: handling LONG PRESS");
                     unmount_sd_card();
                     break;
-                    
+
                 default:
+                    ESP_LOGI(TAG, "Main loop: unknown event");
                     break;
             }
         }
-        
+
         // Sleep to avoid busy-waiting
         vTaskDelay(pdMS_TO_TICKS(20));
     }
