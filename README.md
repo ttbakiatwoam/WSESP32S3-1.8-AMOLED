@@ -1,5 +1,16 @@
 # Ghost ESP: Revival
 
+## ✅ Completed: C App Image Viewer Bring-up
+- [x] Build and flash original C image viewer app
+- [x] Verify SD card image loading
+- [x] Validate display output (Waveshare 1.8" AMOLED)
+- [x] Confirm touch controller (CST816T) works
+- [x] Confirm IMU (QMI8658) works
+- [x] Test FreeRTOS task scheduling
+- [x] Validate PSRAM usage and memory allocation
+- [x] Confirm robust error handling and recovery
+- [x] Document hardware wiring and configuration
+
 ## ESP32-S3 AMOLED C++ Image Viewer Bring-up Checklist
 
 - [x] Refactor shared types/statics to header
@@ -7,20 +18,67 @@
 - [x] Remove duplicate definitions from both files
 - [x] Fix build errors: duplicate definitions and missing macros/defines
 - [x] Rebuild, flash, and monitor to verify fix
-- [ ] Debug blank screen on device
-- [ ] Validate display initialization and pin configuration
-- [ ] Check framebuffer/double-buffering logic
-- [ ] Validate SD card and image loading
-- [ ] Validate touch and IMU integration
+- [ ] Debug blank screen on device (check display init, pin config, buffer usage)
+- [ ] Validate runtime logic for display, SD, and touch
+- [ ] Document hardware wiring and configuration
 - [ ] Restore/test all original C app features in C++
 - [ ] Add more logging for bring-up and diagnostics
-- [ ] Document hardware wiring and configuration
+- [ ] Validate touch controller (CST816T) integration
+- [ ] Validate IMU (QMI8658) integration
+- [ ] Validate Bluetooth initialization and communication
+- [ ] Test FreeRTOS task scheduling and performance
+- [ ] Verify PSRAM usage and memory allocation
+- [ ] Ensure robust error handling and recovery
+- [ ] Add/verify support for additional sensors or peripherals as needed
 
-> **Note:** this is a detached fork of [Spooky's GhostESP](https://github.com/Spooks4576/Ghost_ESP) which has been archived and not in development anymore.
+**Goal:**
+Fully working, maintainable, robust C++ image viewer with all original features, running on ESP32-S3 with Waveshare AMOLED, CST816T, QMI8658, and SD card.
 
-**⭐️ Enjoying Ghost ESP? Please give the repo a star!**
+---
 
-Ghost ESP turns your ESP32 into a powerful, cheap and helpful wireless testing tool. Built on ESP-IDF.
+## Future Enhancements & Optimizations
+
+**Performance Optimization:**
+- [ ] Improve image loading speed, buffer management, or reduce memory usage.
+
+**Feature Enhancements:**
+- [ ] Add support for more image formats (e.g., BMP, WebP).
+- [ ] Implement image slideshow/auto-advance mode.
+- [ ] Add on-screen UI elements (e.g., image counter, file name, battery status).
+- [ ] Support for image deletion or marking favorites.
+
+**Touch Improvements:**
+- [ ] Add swipe gestures for previous/next image.
+- [ ] Fine-tune gesture sensitivity or add custom gestures.
+
+**Error Handling:**
+- [ ] More robust SD card error recovery.
+- [ ] User feedback for missing/corrupt images.
+
+**Power Management:**
+- [ ] Add display sleep/auto-off after inactivity.
+- [ ] Wake on touch.
+
+**Documentation & Code Cleanup:**
+- [ ] Add comments, README updates, or refactor code for maintainability.
+
+**Testing:**
+- [ ] Add more test images, edge cases, or stress tests.
+
+---
+
+## Long-Term Integration Goals
+
+- [ ] Integrate GhostESP features and architecture into this build
+- [ ] Refactor codebase for compatibility with upstream GhostESP
+- [ ] Prepare and document device configuration for upstream contribution
+- [ ] Test full GhostESP feature set on ESP32-S3 AMOLED hardware
+- [ ] Submit pull request or patch with device config and integration changes to the GhostESP repository
+- [ ] Collaborate with GhostESP maintainers for review and merge
+- [ ] Enable rapid device identification and bring-up: make it easy to detect a supported device and get it running quickly using this repo's codebase
+
+**Vision:**
+Make it possible to identify any supported device and bring it up rapidly, with minimal manual configuration, using the code and documentation in this repository.
 
 ---
 
