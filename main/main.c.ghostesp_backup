@@ -1,0 +1,134 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+
+// LVGL
+#include "lvgl.h"
+#include "lvgl_helpers.h"
+
+// Display and touch drivers
+#include "rm67162.h"
+#include "cst816t.h"
+
+static const char *TAG = "DISPLAY_TEST";
+
+// LVGL display buffer
+#define LVGL_BUFF_SIZE (368 * 64)
+static lv_color_t buf1[LVGL_BUFF_SIZE];
+static lv_color_t buf2[LVGL_BUFF_SIZE];
+
+// LVGL input device
+static lv_indev_drv_t indev_drv;
+static lv_indev_t *indev;
+
+static void display_flush(lv_display_t *display, const lv_area_t *area, uint8_t *color_p) {
+    rm67162_flush(display, area, (lv_color_t *)color_p);
+}
+
+static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+    cst816t_read(drv, data);
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "=== SIMPLE DISPLAY + TOUCH TEST ===");
+    ESP_LOGI(TAG, "Starting minimal display test...");
+
+    // Initialize display (low-level)
+    ESP_LOGI(TAG, "Initializing RM67162 QSPI display...");
+    rm67162_init();
+    ESP_LOGI(TAG, "RM67162 initialized");
+
+    // Initialize touch (low-level)
+    ESP_LOGI(TAG, "Initializing CST816T touch...");
+    cst816t_init();
+    ESP_LOGI(TAG, "CST816T initialized");
+
+    // Initialize LVGL
+    ESP_LOGI(TAG, "Initializing LVGL...");
+    lv_init();
+
+    // Create display
+    lv_display_t *disp = lv_display_create(368, 448);
+    lv_display_set_flush_cb(disp, display_flush);
+    lv_display_set_buffers(disp, buf1, buf2, LVGL_BUFF_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    ESP_LOGI(TAG, "LVGL display created (368x448)");
+
+    // Create input device for touch
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = touch_read;
+    indev = lv_indev_drv_register(&indev_drv);
+    ESP_LOGI(TAG, "LVGL touch input registered");
+
+    // Create simple test screen
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a1a2e), 0);
+
+    // Title label
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "Display + Touch Test");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+
+    // Status label
+    lv_obj_t *status = lv_label_create(scr);
+    lv_label_set_text(status, "Touch screen to test");
+    lv_obj_align(status, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_text_color(status, lv_color_hex(0x00FF00), 0);
+    lv_obj_set_style_text_font(status, &lv_font_montserrat_12, 0);
+
+    // Coordinate display label
+    lv_obj_t *coord = lv_label_create(scr);
+    lv_label_set_text(coord, "X: --- Y: ---");
+    lv_obj_align(coord, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_set_style_text_color(coord, lv_color_hex(0x00FFFF), 0);
+    lv_obj_set_style_text_font(coord, &lv_font_montserrat_12, 0);
+
+    // Test with some colored rectangles
+    lv_obj_t *rect1 = lv_obj_create(scr);
+    lv_obj_set_size(rect1, 60, 40);
+    lv_obj_align(rect1, LV_ALIGN_TOP_LEFT, 10, 60);
+    lv_obj_set_style_bg_color(rect1, lv_color_hex(0xFF0000), 0);
+    lv_obj_set_style_border_width(rect1, 0, 0);
+
+    lv_obj_t *rect2 = lv_obj_create(scr);
+    lv_obj_set_size(rect2, 60, 40);
+    lv_obj_align(rect2, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_bg_color(rect2, lv_color_hex(0x00FF00), 0);
+    lv_obj_set_style_border_width(rect2, 0, 0);
+
+    lv_obj_t *rect3 = lv_obj_create(scr);
+    lv_obj_set_size(rect3, 60, 40);
+    lv_obj_align(rect3, LV_ALIGN_TOP_RIGHT, -10, 60);
+    lv_obj_set_style_bg_color(rect3, lv_color_hex(0x0000FF), 0);
+    lv_obj_set_style_border_width(rect3, 0, 0);
+
+    ESP_LOGI(TAG, "Screen created with test elements");
+    ESP_LOGI(TAG, "=== BOOT COMPLETE ===");
+
+    // Main loop
+    uint32_t last_update = 0;
+    while (1) {
+        lv_task_handler();
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+        // Update coordinates periodically
+        uint32_t now = lv_tick_get();
+        if (now - last_update > 200) {
+            last_update = now;
+            
+            // Get current touch point if any
+            lv_point_t point;
+            if (lv_indev_get_point(indev, &point)) {
+                static char buf[32];
+                snprintf(buf, sizeof(buf), "X: %d Y: %d", point.x, point.y);
+                lv_label_set_text(coord, buf);
+            }
+        }
+    }
+}

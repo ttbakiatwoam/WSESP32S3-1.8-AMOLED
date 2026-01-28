@@ -27,6 +27,7 @@
 #include "esp32s3/rom/tjpgd.h"
 #include "pngle.h"
 #include "gifdec.h"
+#include "esp_timer.h"
 
 static const char *TAG = "sd_image_test";
 
@@ -89,6 +90,20 @@ static bool sd_mounted = false;
 static cst816t_handle_t global_touch_handle = NULL;  // For GIF animation touch detection
 static bool stop_animation = false;
 static bool animation_running = false;
+
+// Touch gesture events
+typedef enum {
+    TOUCH_EVENT_NONE = 0,
+    TOUCH_EVENT_TAP,
+    TOUCH_EVENT_DOUBLE_TAP,
+    TOUCH_EVENT_LONG_PRESS
+} touch_event_t;
+
+static volatile touch_event_t pending_touch_event = TOUCH_EVENT_NONE;
+
+// Forward declarations
+static int scan_for_images(void);
+static void touch_task(void *pvParameters);
 
 // TCA9554 register addresses
 #define TCA9554_REG_OUTPUT   0x01
@@ -213,20 +228,17 @@ static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h)
     uint32_t x_ratio = ((src_w - 1) << 16) / dst_w;
     uint32_t y_ratio = ((src_h - 1) << 16) / dst_h;
     
-    // Draw line by line
+    // Draw line by line (original, safe)
     for (uint16_t y = 0; y < dst_h; y++) {
         uint32_t src_y = (y * y_ratio) >> 16;
-        
         for (uint16_t x = 0; x < dst_w; x++) {
             uint32_t src_x = (x * x_ratio) >> 16;
             int idx = (src_y * src_w + src_x) * 3;
-            
             uint8_t r = src[idx + 0];
             uint8_t g = src[idx + 1];
             uint8_t b = src[idx + 2];
             draw_buffer[x] = rgb888_to_rgb565(r, g, b);
         }
-        
         esp_lcd_panel_draw_bitmap(panel_handle, x_off, y_off + y, 
                                   x_off + dst_w, y_off + y + 1, draw_buffer);
     }
@@ -263,12 +275,37 @@ static unsigned int tjpgd_input_func(JDEC *jd, uint8_t *buff, unsigned int nbyte
     }
 }
 
-// TJPGD output callback - write pixels to display
+// TJPGD output callback - write pixels to display or buffer
 static UINT tjpgd_output_func(JDEC *jd, void *bitmap, JRECT *rect)
 {
     tjpgd_ctx_t *ctx = (tjpgd_ctx_t *)jd->device;
     
-    // Apply centering offset
+    // Check if we're capturing to buffer (x_offset < 0 is the signal)
+    if (ctx->x_offset < 0) {
+        // Write to buffer for later scaling
+        uint8_t *src = (uint8_t *)bitmap;
+        uint8_t *dst = ctx->work_buf;  // Reusing work_buf pointer to hold output buffer
+        
+        uint16_t w = rect->right - rect->left + 1;
+        uint16_t h = rect->bottom - rect->top + 1;
+        uint16_t output_width = ctx->out_w;
+        
+        for (int row = 0; row < h; row++) {
+            int dst_y = rect->top + row;
+            for (int col = 0; col < w; col++) {
+                int dst_x = rect->left + col;
+                int src_idx = (row * w + col) * 3;
+                int dst_idx = (dst_y * output_width + dst_x) * 3;
+                
+                dst[dst_idx + 0] = src[src_idx + 0];
+                dst[dst_idx + 1] = src[src_idx + 1];
+                dst[dst_idx + 2] = src[src_idx + 2];
+            }
+        }
+        return 1;
+    }
+    
+    // Normal display path - apply centering offset
     int16_t x = rect->left + ctx->x_offset;
     int16_t y = rect->top + ctx->y_offset;
     uint16_t w = rect->right - rect->left + 1;
@@ -414,18 +451,36 @@ static esp_err_t display_jpeg(const char *path)
         }
         
         if (jpeg_buf) {
-            // We need to modify the decoder to write to buffer instead of display
-            // For now, just decode directly and center (simpler approach)
-            ESP_LOGI(TAG, "Small JPEG - decoding at native size for software scaling");
+            ESP_LOGI(TAG, "Small JPEG - decoding to buffer for upscaling");
             
-            // Store buffer info in context for the output callback to use
-            tjpgd_ctx.x_offset = 0;  // Will write to top-left of output buffer
+            // Setup context for buffer capture
+            tjpgd_ctx.x_offset = -1;  // Signal to capture to buffer
             tjpgd_ctx.y_offset = 0;
+            tjpgd_ctx.work_buf = jpeg_buf;  // Reuse pointer to store output buffer
+            tjpgd_ctx.out_w = scaled_w;
+            tjpgd_ctx.out_h = scaled_h;
             
-            // Actually for simplicity, let's just decode directly to display with centering
-            // Full software scaling would require modifying the output callback significantly
+            res = jd_decomp(&jdec, tjpgd_output_func, scale);
+            
+            if (res == JDR_OK) {
+                // Clear screen
+                fill_screen_color(0x0000);
+                
+                // Now scale the buffer to display
+                scale_and_draw_rgb888(jpeg_buf, scaled_w, scaled_h);
+            }
+            
             free(jpeg_buf);
-            needs_software_scale = false;
+            free(work_buf);
+            fclose(fp);
+            
+            if (res != JDR_OK) {
+                ESP_LOGE(TAG, "JPEG decompress failed: %d", res);
+                return ESP_FAIL;
+            }
+            
+            ESP_LOGI(TAG, "JPEG decoded and upscaled successfully");
+            return ESP_OK;
         } else {
             needs_software_scale = false;
         }
@@ -625,7 +680,7 @@ static esp_err_t display_gif(const char *path)
         return ESP_FAIL;
     }
     
-    ESP_LOGI(TAG, "GIF size: %dx%d, colors: %d, frames: %d", gif->width, gif->height, gif->palette->size, gif->nframes);
+    ESP_LOGI(TAG, "GIF size: %dx%d, colors: %d", gif->width, gif->height, gif->palette->size);
     
     // Allocate frame buffer (RGB888) - try PSRAM first
     size_t frame_size = gif->width * gif->height * 3;
@@ -776,6 +831,11 @@ static void unmount_sd_card(void)
 {
     if (sd_mounted) {
         ESP_LOGI(TAG, "Unmounting SD card...");
+        
+        // Stop any running animations
+        stop_animation = true;
+        vTaskDelay(pdMS_TO_TICKS(100));  // Wait for animation to stop
+        
         esp_vfs_fat_sdcard_unmount(MOUNT_POINT, sd_card);
         sd_card = NULL;
         sd_mounted = false;
@@ -791,8 +851,25 @@ static void remount_sd_card(void)
 {
     ESP_LOGI(TAG, "Attempting to remount SD card...");
     
+    // If already mounted, just rescan
+    if (sd_mounted) {
+        ESP_LOGI(TAG, "SD card already mounted, rescanning...");
+        int found = scan_for_images();
+        if (found > 0) {
+            use_images = true;
+            current_image = 0;
+            ESP_LOGI(TAG, "Found %d images", found);
+            display_image(image_paths[current_image]);
+        } else {
+            ESP_LOGW(TAG, "No images found");
+            fill_screen_color(0xFFE0);  // Yellow
+        }
+        return;
+    }
+    
     // Clear screen and show status
     fill_screen_color(0x001F);  // Blue background
+    vTaskDelay(pdMS_TO_TICKS(200));
     
     if (init_sd_card() == ESP_OK) {
         int found = scan_for_images();
@@ -813,6 +890,7 @@ static void remount_sd_card(void)
     } else {
         ESP_LOGE(TAG, "Failed to remount SD card");
         fill_screen_color(0xF800);  // Red - error
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -867,6 +945,97 @@ static void show_next_content(int *color_idx)
         ESP_LOGI(TAG, "Image %d/%d: %s", current_image + 1, num_images, image_paths[current_image]);
     }
     // No color cycling - this is a dedicated image viewer
+}
+
+// Dedicated touch handling task - runs in parallel for responsive input
+static void touch_task(void *pvParameters)
+{
+    cst816t_handle_t touch_handle = (cst816t_handle_t)pvParameters;
+    
+    bool was_touching = false;
+    uint32_t touch_start_time = 0;
+    uint32_t last_tap_time = 0;
+    bool long_press_handled = false;
+    bool waiting_for_double_tap = false;
+    uint32_t action_cooldown_until = 0;
+    
+    const uint32_t DOUBLE_TAP_WINDOW = 250;   // 250ms for double tap
+    const uint32_t LONG_PRESS_TIME = 1200;    // 1.2s for long press
+    const uint32_t ACTION_COOLDOWN = 300;     // 300ms cooldown after actions
+    
+    ESP_LOGI(TAG, "Touch task started");
+    
+    while (1) {
+        bool touched = false;
+        uint32_t current_time = esp_timer_get_time() / 1000;  // Convert to ms
+        
+        if (touch_handle) {
+            cst816t_touch_data_t touch_data;
+            esp_err_t ret = cst816t_read_touch(touch_handle, &touch_data);
+            if (ret == ESP_OK && touch_data.event != 0) {
+                touched = true;
+            }
+        }
+        
+        // Skip processing during cooldown
+        if (current_time < action_cooldown_until) {
+            was_touching = touched;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        
+        // Touch started
+        if (touched && !was_touching) {
+            touch_start_time = current_time;
+            long_press_handled = false;
+            
+            // Check for double tap (second tap within window)
+            if (waiting_for_double_tap && (current_time - last_tap_time) < DOUBLE_TAP_WINDOW) {
+                ESP_LOGI(TAG, "Double tap detected");
+                pending_touch_event = TOUCH_EVENT_DOUBLE_TAP;
+                waiting_for_double_tap = false;
+                action_cooldown_until = current_time + ACTION_COOLDOWN;
+                long_press_handled = true;  // Prevent further actions this touch
+            }
+        }
+        
+        // Long press detection (while still touching)
+        if (touched && was_touching && !long_press_handled && (current_time - touch_start_time) >= LONG_PRESS_TIME) {
+            ESP_LOGI(TAG, "Long press detected");
+            pending_touch_event = TOUCH_EVENT_LONG_PRESS;
+            long_press_handled = true;
+            waiting_for_double_tap = false;
+            action_cooldown_until = current_time + ACTION_COOLDOWN;
+        }
+        
+        // Touch released
+        if (!touched && was_touching && !long_press_handled) {
+            uint32_t press_duration = current_time - touch_start_time;
+            
+            // Short tap - wait to see if it's a double tap
+            if (press_duration < LONG_PRESS_TIME) {
+                if (waiting_for_double_tap) {
+                    // This shouldn't happen (double tap handled on touch start)
+                    waiting_for_double_tap = false;
+                } else {
+                    // First tap - wait for possible second tap
+                    waiting_for_double_tap = true;
+                    last_tap_time = current_time;
+                }
+            }
+        }
+        
+        // Single tap timeout - no second tap came
+        if (waiting_for_double_tap && !touched && (current_time - last_tap_time) >= DOUBLE_TAP_WINDOW) {
+            ESP_LOGI(TAG, "Single tap");
+            pending_touch_event = TOUCH_EVENT_TAP;
+            waiting_for_double_tap = false;
+            action_cooldown_until = current_time + 150;  // Shorter cooldown for tap
+        }
+        
+        was_touching = touched;
+        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms polling for very responsive detection
+    }
 }
 
 void app_main(void)
@@ -926,14 +1095,20 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     
+    // Set display rotation (portrait, no rotation)
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
+    
     // Allocate draw buffer (needs to be big enough for JPEG MCU blocks)
     draw_buffer = heap_caps_malloc(DISPLAY_WIDTH * 16 * 2, MALLOC_CAP_DMA);
     if (!draw_buffer) {
         ESP_LOGE(TAG, "Failed to allocate draw buffer!");
         return;
     }
-    
-    ESP_LOGI(TAG, "Display initialized!");
+
+    ESP_LOGI(TAG, "Display initialized! Forcing white fill to test display...");
+    fill_screen_color(0xFFFF); // White
+    vTaskDelay(pdMS_TO_TICKS(1000));
     
     // Initialize touch
     ESP_LOGI(TAG, "Initializing touch...");
@@ -958,6 +1133,20 @@ void app_main(void)
     // Set global touch handle for use in animations
     global_touch_handle = touch_handle;
     
+    // Create dedicated touch task for responsive input
+    if (touch_handle) {
+        xTaskCreatePinnedToCore(
+            touch_task,           // Task function
+            "touch_task",         // Name
+            4096,                 // Stack size
+            touch_handle,         // Parameters
+            5,                    // Priority (higher than default)
+            NULL,                 // Task handle
+            0                     // Core 0 (only core in unicore mode)
+        );
+        ESP_LOGI(TAG, "Touch task created");
+    }
+    
     // Initialize SD card
     bool sd_ok = (init_sd_card() == ESP_OK);
     
@@ -981,52 +1170,35 @@ void app_main(void)
         fill_screen_color(0xFFE0);  // Yellow - no images
     }
     
-    bool was_touching = false;
-    uint32_t last_touch_time = 0;
-    uint32_t last_touch_end_time = 0;
-    uint32_t double_tap_window = 400;  // 400ms for double tap
-    uint32_t long_press_threshold = 1500;  // 1.5s for long press
-    
-    // Main loop
+    // Main loop - handle touch events from background task
     while (1) {
-        bool touched = false;
-        uint32_t current_time = esp_timer_get_time() / 1000;  // Convert to ms
+        // Check for touch events from the touch task
+        touch_event_t event = pending_touch_event;
         
-        if (touch_handle) {
-            cst816t_touch_data_t touch_data;
-            esp_err_t ret = cst816t_read_touch(touch_handle, &touch_data);
-            if (ret == ESP_OK && touch_data.event != 0) {  // FIXED: event != 0 detects touch
-                touched = true;
-            }
-        }
-        
-        // Detect single tap (short press then release)
-        if (touched && !was_touching) {
-            last_touch_time = current_time;
-        }
-        
-        // Detect release
-        if (!touched && was_touching) {
-            last_touch_end_time = current_time;
-            uint32_t press_duration = last_touch_end_time - last_touch_time;
+        if (event != TOUCH_EVENT_NONE) {
+            // Clear the event
+            pending_touch_event = TOUCH_EVENT_NONE;
             
-            // Single tap: short press (< 1.5s) and not double tapping
-            if (press_duration < long_press_threshold) {
-                show_next_content(NULL);
+            // Handle the event
+            switch (event) {
+                case TOUCH_EVENT_TAP:
+                    show_next_content(NULL);
+                    break;
+                    
+                case TOUCH_EVENT_DOUBLE_TAP:
+                    remount_sd_card();
+                    break;
+                    
+                case TOUCH_EVENT_LONG_PRESS:
+                    unmount_sd_card();
+                    break;
+                    
+                default:
+                    break;
             }
         }
         
-        // Detect long press (1.5+ seconds)
-        if (touched && (current_time - last_touch_time) >= long_press_threshold) {
-            unmount_sd_card();
-        }
-        
-        // Detect double tap (two taps within 400ms)
-        if (touched && !was_touching && (current_time - last_touch_end_time) < double_tap_window) {
-            remount_sd_card();
-        }
-        
-        was_touching = touched;
-        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling for responsive detection
+        // Sleep to avoid busy-waiting
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
