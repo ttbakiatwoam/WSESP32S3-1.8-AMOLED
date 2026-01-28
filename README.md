@@ -1,5 +1,21 @@
 # Ghost ESP: Revival
 
+## ESP32-S3 AMOLED C++ Image Viewer Bring-up Checklist
+
+- [x] Refactor shared types/statics to header
+- [x] Update C and C++ files to use shared header
+- [x] Remove duplicate definitions from both files
+- [x] Fix build errors: duplicate definitions and missing macros/defines
+- [x] Rebuild, flash, and monitor to verify fix
+- [ ] Debug blank screen on device
+- [ ] Validate display initialization and pin configuration
+- [ ] Check framebuffer/double-buffering logic
+- [ ] Validate SD card and image loading
+- [ ] Validate touch and IMU integration
+- [ ] Restore/test all original C app features in C++
+- [ ] Add more logging for bring-up and diagnostics
+- [ ] Document hardware wiring and configuration
+
 > **Note:** this is a detached fork of [Spooky's GhostESP](https://github.com/Spooks4576/Ghost_ESP) which has been archived and not in development anymore.
 
 **⭐️ Enjoying Ghost ESP? Please give the repo a star!**
