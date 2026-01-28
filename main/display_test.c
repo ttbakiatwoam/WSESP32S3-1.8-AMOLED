@@ -40,8 +40,8 @@ static const char *TAG = "sd_image_test";
 #define PIN_LCD_D3      7
 #define PIN_LCD_RST     13
 
-#define DISPLAY_WIDTH   368
-#define DISPLAY_HEIGHT  448
+#define DISPLAY_WIDTH   448
+#define DISPLAY_HEIGHT  368
 
 // I2C pins for TCA9554 GPIO expander and CST816T touch
 #define PIN_I2C_SCL     14
@@ -168,12 +168,14 @@ static esp_err_t tca9554_set_pin_level(uint8_t pin_mask, bool high)
 static void fill_screen_color(uint16_t color)
 {
     if (!draw_buffer || !panel_handle) return;
-    
-    for (int i = 0; i < DISPLAY_WIDTH * 10; i++) {
+    // Always fill the full rotated display area (landscape)
+    int fill_w = DISPLAY_HEIGHT;  // 448
+    int fill_h = DISPLAY_WIDTH;   // 368
+    for (int i = 0; i < fill_w * 10; i++) {
         draw_buffer[i] = color;
     }
-    for (int y = 0; y < DISPLAY_HEIGHT; y += 10) {
-        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + 10, draw_buffer);
+    for (int y = 0; y < fill_h; y += 10) {
+        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, fill_w, y + 10, draw_buffer);
     }
 }
 
@@ -193,24 +195,19 @@ static void calc_fit_scale(uint16_t src_w, uint16_t src_h,
                            uint16_t *dst_w, uint16_t *dst_h,
                            int16_t *x_off, int16_t *y_off)
 {
+    // For 90° CCW rotation, swap display width/height
+    uint16_t disp_w = DISPLAY_HEIGHT;
+    uint16_t disp_h = DISPLAY_WIDTH;
     // Calculate scale factors (using fixed point 16.16 for precision)
-    uint32_t scale_x = (DISPLAY_WIDTH << 16) / src_w;
-    uint32_t scale_y = (DISPLAY_HEIGHT << 16) / src_h;
-    
-    // Use smaller scale to fit within display (preserving aspect ratio)
+    uint32_t scale_x = (disp_w << 16) / src_w;
+    uint32_t scale_y = (disp_h << 16) / src_h;
     uint32_t scale = (scale_x < scale_y) ? scale_x : scale_y;
-    
-    // Calculate output dimensions
     *dst_w = (src_w * scale) >> 16;
     *dst_h = (src_h * scale) >> 16;
-    
-    // Clamp to display size
-    if (*dst_w > DISPLAY_WIDTH) *dst_w = DISPLAY_WIDTH;
-    if (*dst_h > DISPLAY_HEIGHT) *dst_h = DISPLAY_HEIGHT;
-    
-    // Center on display
-    *x_off = (DISPLAY_WIDTH - *dst_w) / 2;
-    *y_off = (DISPLAY_HEIGHT - *dst_h) / 2;
+    if (*dst_w > disp_w) *dst_w = disp_w;
+    if (*dst_h > disp_h) *dst_h = disp_h;
+    *x_off = (disp_w - *dst_w) / 2;
+    *y_off = (disp_h - *dst_h) / 2;
 }
 
 // Scale and draw RGB888 image to display with bilinear-ish interpolation
@@ -227,20 +224,20 @@ static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h)
     // Fixed-point scale factors (16.16)
     uint32_t x_ratio = ((src_w - 1) << 16) / dst_w;
     uint32_t y_ratio = ((src_h - 1) << 16) / dst_h;
-    
-    // Draw line by line (original, safe)
+    // No software rotation: draw scaled image directly
     for (uint16_t y = 0; y < dst_h; y++) {
-        uint32_t src_y = (y * y_ratio) >> 16;
         for (uint16_t x = 0; x < dst_w; x++) {
             uint32_t src_x = (x * x_ratio) >> 16;
+            uint32_t src_y = (y * y_ratio) >> 16;
+            if (src_x >= src_w) src_x = src_w - 1;
+            if (src_y >= src_h) src_y = src_h - 1;
             int idx = (src_y * src_w + src_x) * 3;
             uint8_t r = src[idx + 0];
             uint8_t g = src[idx + 1];
             uint8_t b = src[idx + 2];
             draw_buffer[x] = rgb888_to_rgb565(r, g, b);
         }
-        esp_lcd_panel_draw_bitmap(panel_handle, x_off, y_off + y, 
-                                  x_off + dst_w, y_off + y + 1, draw_buffer);
+        esp_lcd_panel_draw_bitmap(panel_handle, x_off, y_off + y, x_off + dst_w, y_off + y + 1, draw_buffer);
     }
 }
 
@@ -311,44 +308,42 @@ static UINT tjpgd_output_func(JDEC *jd, void *bitmap, JRECT *rect)
     uint16_t w = rect->right - rect->left + 1;
     uint16_t h = rect->bottom - rect->top + 1;
     
+    // For landscape, swap display width/height
+    uint16_t disp_w = DISPLAY_HEIGHT;
+    uint16_t disp_h = DISPLAY_WIDTH;
     // Skip if completely outside display
-    if (x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT || x + w <= 0 || y + h <= 0) {
+    if (x >= disp_w || y >= disp_h || x + w <= 0 || y + h <= 0) {
         return 1;  // Continue decoding
     }
-    
     // Calculate source and destination clipping
     int src_x_start = 0, src_y_start = 0;
     int dst_x = x, dst_y = y;
     int draw_w = w, draw_h = h;
-    
     // Clip left edge
     if (x < 0) {
         src_x_start = -x;
         draw_w += x;
         dst_x = 0;
     }
-    // Clip top edge  
+    // Clip top edge
     if (y < 0) {
         src_y_start = -y;
         draw_h += y;
         dst_y = 0;
     }
     // Clip right edge
-    if (dst_x + draw_w > DISPLAY_WIDTH) {
-        draw_w = DISPLAY_WIDTH - dst_x;
+    if (dst_x + draw_w > disp_w) {
+        draw_w = disp_w - dst_x;
     }
     // Clip bottom edge
-    if (dst_y + draw_h > DISPLAY_HEIGHT) {
-        draw_h = DISPLAY_HEIGHT - dst_y;
+    if (dst_y + draw_h > disp_h) {
+        draw_h = disp_h - dst_y;
     }
-    
     if (draw_w <= 0 || draw_h <= 0) {
         return 1;
     }
-    
     // Convert RGB888 to RGB565 and draw
     uint8_t *src = (uint8_t *)bitmap;
-    
     for (int row = 0; row < draw_h; row++) {
         for (int col = 0; col < draw_w; col++) {
             int src_idx = ((src_y_start + row) * w + (src_x_start + col)) * 3;
@@ -357,7 +352,8 @@ static UINT tjpgd_output_func(JDEC *jd, void *bitmap, JRECT *rect)
             uint8_t b = src[src_idx + 2];
             draw_buffer[col] = rgb888_to_rgb565(r, g, b);
         }
-        esp_lcd_panel_draw_bitmap(panel_handle, dst_x, dst_y + row, dst_x + draw_w, dst_y + row + 1, draw_buffer);
+        // For landscape, swap x/y for drawing
+        esp_lcd_panel_draw_bitmap(panel_handle, dst_y + row, dst_x, dst_y + row + 1, dst_x + draw_w, draw_buffer);
     }
     
     return 1;  // Continue decoding
@@ -822,6 +818,7 @@ static esp_err_t init_sd_card(void)
     
     sd_mounted = true;
     ESP_LOGI(TAG, "SD card mounted!");
+    printf("[MONITOR] SD card successfully mounted.\n");
     sdmmc_card_print_info(stdout, sd_card);
     
     return ESP_OK;
@@ -844,6 +841,7 @@ static void unmount_sd_card(void)
         current_image = 0;
         fill_screen_color(0x07E0);  // Show green immediately to confirm unmount
         ESP_LOGI(TAG, "SD card unmounted - safe to remove");
+        printf("[MONITOR] SD card unmounted - safe to remove.\n");
     }
 }
 
@@ -876,11 +874,12 @@ static void remount_sd_card(void)
         if (found > 0) {
             use_images = true;
             current_image = 0;
-            
             ESP_LOGI(TAG, "=========================================");
             ESP_LOGI(TAG, "  SD card remounted - %d images found!", found);
             ESP_LOGI(TAG, "=========================================");
-            
+            // Show green for success
+            fill_screen_color(0x07E0);
+            vTaskDelay(pdMS_TO_TICKS(200));
             // Show first image
             display_image(image_paths[current_image]);
         } else {
@@ -988,14 +987,16 @@ static void touch_task(void *pvParameters)
         if (touched && !was_touching) {
             touch_start_time = current_time;
             long_press_handled = false;
-            
-            // Check for double tap (second tap within window)
             if (waiting_for_double_tap && (current_time - last_tap_time) < DOUBLE_TAP_WINDOW) {
                 ESP_LOGI(TAG, "Double tap detected");
                 pending_touch_event = TOUCH_EVENT_DOUBLE_TAP;
                 waiting_for_double_tap = false;
                 action_cooldown_until = current_time + ACTION_COOLDOWN;
-                long_press_handled = true;  // Prevent further actions this touch
+                long_press_handled = true;
+            } else {
+                // First tap: start waiting for double tap
+                waiting_for_double_tap = true;
+                last_tap_time = current_time;
             }
         }
         
@@ -1006,31 +1007,28 @@ static void touch_task(void *pvParameters)
             long_press_handled = true;
             waiting_for_double_tap = false;
             action_cooldown_until = current_time + ACTION_COOLDOWN;
+            // Immediate feedback for long-press (green screen)
+            fill_screen_color(0x07E0);
         }
-        
+
         // Touch released
-        if (!touched && was_touching && !long_press_handled) {
+        if (!touched && was_touching) {
             uint32_t press_duration = current_time - touch_start_time;
-            
-            // Short tap - wait to see if it's a double tap
-            if (press_duration < LONG_PRESS_TIME) {
-                if (waiting_for_double_tap) {
-                    // This shouldn't happen (double tap handled on touch start)
-                    waiting_for_double_tap = false;
-                } else {
-                    // First tap - wait for possible second tap
-                    waiting_for_double_tap = true;
-                    last_tap_time = current_time;
+            if (!long_press_handled) {
+                // Short tap: trigger immediately
+                if (press_duration < LONG_PRESS_TIME) {
+                    ESP_LOGI(TAG, "Single tap");
+                    pending_touch_event = TOUCH_EVENT_TAP;
+                    action_cooldown_until = current_time + 150;  // Shorter cooldown for tap
+                    // Do NOT clear waiting_for_double_tap here; allow second tap
                 }
             }
+            // If long-press was handled, do nothing (event already set)
         }
-        
-        // Single tap timeout - no second tap came
-        if (waiting_for_double_tap && !touched && (current_time - last_tap_time) >= DOUBLE_TAP_WINDOW) {
-            ESP_LOGI(TAG, "Single tap");
-            pending_touch_event = TOUCH_EVENT_TAP;
+
+        // Expire double-tap window if time exceeded
+        if (waiting_for_double_tap && (current_time - last_tap_time) > DOUBLE_TAP_WINDOW) {
             waiting_for_double_tap = false;
-            action_cooldown_until = current_time + 150;  // Shorter cooldown for tap
         }
         
         was_touching = touched;
@@ -1095,8 +1093,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     
-    // Set display rotation (portrait, no rotation)
-    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, false));
+    // Set display rotation (90° counter-clockwise, alternate mirror)
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
     
     // Allocate draw buffer (needs to be big enough for JPEG MCU blocks)
@@ -1119,8 +1117,8 @@ void app_main(void)
         .rst_gpio = -1,
         .width = DISPLAY_WIDTH,
         .height = DISPLAY_HEIGHT,
-        .swap_xy = false,
-        .invert_x = false,
+        .swap_xy = true,
+        .invert_x = true,
         .invert_y = false,
     };
     
