@@ -31,6 +31,9 @@
 
 static const char *TAG = "sd_image_test";
 
+// Forward declaration for JPEG rotation helper
+void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h);
+
 // Waveshare 1.8" AMOLED pin definitions
 #define PIN_LCD_CS      12
 #define PIN_LCD_SCK     11
@@ -40,8 +43,8 @@ static const char *TAG = "sd_image_test";
 #define PIN_LCD_D3      7
 #define PIN_LCD_RST     13
 
-#define DISPLAY_WIDTH   448
-#define DISPLAY_HEIGHT  368
+#define PORTRAIT_WIDTH   368
+#define PORTRAIT_HEIGHT  448
 
 // I2C pins for TCA9554 GPIO expander and CST816T touch
 #define PIN_I2C_SCL     14
@@ -168,9 +171,9 @@ static esp_err_t tca9554_set_pin_level(uint8_t pin_mask, bool high)
 static void fill_screen_color(uint16_t color)
 {
     if (!draw_buffer || !panel_handle) return;
-    // Always fill the full rotated display area (landscape)
-    int fill_w = DISPLAY_HEIGHT;  // 448
-    int fill_h = DISPLAY_WIDTH;   // 368
+    // Always fill the full display area (portrait)
+    int fill_w = PORTRAIT_WIDTH;
+    int fill_h = PORTRAIT_HEIGHT;
     for (int i = 0; i < fill_w * 10; i++) {
         draw_buffer[i] = color;
     }
@@ -195,9 +198,9 @@ static void calc_fit_scale(uint16_t src_w, uint16_t src_h,
                            uint16_t *dst_w, uint16_t *dst_h,
                            int16_t *x_off, int16_t *y_off)
 {
-    // For 90° CCW rotation, swap display width/height
-    uint16_t disp_w = DISPLAY_HEIGHT;
-    uint16_t disp_h = DISPLAY_WIDTH;
+    // For portrait, use original display width/height
+    uint16_t disp_w = PORTRAIT_WIDTH;
+    uint16_t disp_h = PORTRAIT_HEIGHT;
     // Calculate scale factors (using fixed point 16.16 for precision)
     uint32_t scale_x = (disp_w << 16) / src_w;
     uint32_t scale_y = (disp_h << 16) / src_h;
@@ -224,7 +227,7 @@ static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h)
     // Fixed-point scale factors (16.16)
     uint32_t x_ratio = ((src_w - 1) << 16) / dst_w;
     uint32_t y_ratio = ((src_h - 1) << 16) / dst_h;
-    // No software rotation: draw scaled image directly
+    // Draw scaled image directly (portrait)
     for (uint16_t y = 0; y < dst_h; y++) {
         for (uint16_t x = 0; x < dst_w; x++) {
             uint32_t src_x = (x * x_ratio) >> 16;
@@ -308,9 +311,9 @@ static UINT tjpgd_output_func(JDEC *jd, void *bitmap, JRECT *rect)
     uint16_t w = rect->right - rect->left + 1;
     uint16_t h = rect->bottom - rect->top + 1;
     
-    // For landscape, swap display width/height
-    uint16_t disp_w = DISPLAY_HEIGHT;
-    uint16_t disp_h = DISPLAY_WIDTH;
+    // For portrait, use original display width/height
+    uint16_t disp_w = PORTRAIT_WIDTH;
+    uint16_t disp_h = PORTRAIT_HEIGHT;
     // Skip if completely outside display
     if (x >= disp_w || y >= disp_h || x + w <= 0 || y + h <= 0) {
         return 1;  // Continue decoding
@@ -352,8 +355,7 @@ static UINT tjpgd_output_func(JDEC *jd, void *bitmap, JRECT *rect)
             uint8_t b = src[src_idx + 2];
             draw_buffer[col] = rgb888_to_rgb565(r, g, b);
         }
-        // For landscape, swap x/y for drawing
-        esp_lcd_panel_draw_bitmap(panel_handle, dst_y + row, dst_x, dst_y + row + 1, dst_x + draw_w, draw_buffer);
+        esp_lcd_panel_draw_bitmap(panel_handle, dst_x, dst_y + row, dst_x + draw_w, dst_y + row + 1, draw_buffer);
     }
     
     return 1;  // Continue decoding
@@ -429,14 +431,14 @@ static esp_err_t display_jpeg(const char *path)
     uint16_t scaled_h = jdec.height;
     
     // Scale down if too large for display
-    while ((scaled_w > DISPLAY_WIDTH || scaled_h > DISPLAY_HEIGHT) && scale < 3) {
+    while ((scaled_w > PORTRAIT_WIDTH || scaled_h > PORTRAIT_HEIGHT) && scale < 3) {
         scale++;
         scaled_w = jdec.width >> scale;
         scaled_h = jdec.height >> scale;
     }
     
     // Check if this is a small image that would benefit from upscaling
-    bool needs_software_scale = (scaled_w < DISPLAY_WIDTH * 0.7 && scaled_h < DISPLAY_HEIGHT * 0.7);
+    bool needs_software_scale = (scaled_w < PORTRAIT_WIDTH * 0.7 && scaled_h < PORTRAIT_HEIGHT * 0.7);
     
     if (needs_software_scale) {
         // Decode to buffer then software scale
@@ -461,9 +463,16 @@ static esp_err_t display_jpeg(const char *path)
             if (res == JDR_OK) {
                 // Clear screen
                 fill_screen_color(0x0000);
-                
-                // Now scale the buffer to display
-                scale_and_draw_rgb888(jpeg_buf, scaled_w, scaled_h);
+                // Rotate buffer 90 CCW
+                uint8_t *rot_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (!rot_buf) rot_buf = heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
+                if (rot_buf) {
+                    rotate_rgb888_90ccw(jpeg_buf, rot_buf, scaled_w, scaled_h);
+                    scale_and_draw_rgb888(rot_buf, scaled_h, scaled_w); // Note: w/h swapped after rotation
+                    free(rot_buf);
+                } else {
+                    scale_and_draw_rgb888(jpeg_buf, scaled_w, scaled_h);
+                }
             }
             
             free(jpeg_buf);
@@ -483,8 +492,8 @@ static esp_err_t display_jpeg(const char *path)
     }
     
     // Calculate centering offsets for direct decode to display
-    tjpgd_ctx.x_offset = (DISPLAY_WIDTH - scaled_w) / 2;
-    tjpgd_ctx.y_offset = (DISPLAY_HEIGHT - scaled_h) / 2;
+    tjpgd_ctx.x_offset = (PORTRAIT_WIDTH - scaled_w) / 2;
+    tjpgd_ctx.y_offset = (PORTRAIT_HEIGHT - scaled_h) / 2;
     
     ESP_LOGI(TAG, "JPEG scaled: %dx%d (scale=1/%d, offset=%d,%d)", 
              scaled_w, scaled_h, 1 << scale, tjpgd_ctx.x_offset, tjpgd_ctx.y_offset);
@@ -720,11 +729,11 @@ static esp_err_t display_gif(const char *path)
                 cst816t_touch_data_t touch_data;
                 esp_err_t touch_ret = cst816t_read_touch(global_touch_handle, &touch_data);
                 if (touch_ret == ESP_OK && touch_data.event != 0) {
+                    // Accept any touch event, anywhere on the screen, to skip GIF
                     stop_animation = true;
                     break;
                 }
             }
-            
             vTaskDelay(pdMS_TO_TICKS(20));
             elapsed += 20;
         }
@@ -749,14 +758,14 @@ static esp_err_t display_bin(const char *path)
     }
     
     const int strip_height = 10;
-    const int strip_size = DISPLAY_WIDTH * strip_height * 2;
+    const int strip_size = PORTRAIT_WIDTH * strip_height * 2;
     
-    for (int y = 0; y < DISPLAY_HEIGHT; y += strip_height) {
+    for (int y = 0; y < PORTRAIT_HEIGHT; y += strip_height) {
         size_t read = fread(draw_buffer, 1, strip_size, f);
         if (read > 0) {
-            int rows = read / (DISPLAY_WIDTH * 2);
+            int rows = read / (PORTRAIT_WIDTH * 2);
             if (rows > 0) {
-                esp_lcd_panel_draw_bitmap(panel_handle, 0, y, DISPLAY_WIDTH, y + rows, draw_buffer);
+                esp_lcd_panel_draw_bitmap(panel_handle, 0, y, PORTRAIT_WIDTH, y + rows, draw_buffer);
             }
         }
         if (read < strip_size) break;
@@ -1083,8 +1092,8 @@ void app_main(void)
         .d3_gpio = PIN_LCD_D3,
         .reset_gpio = PIN_LCD_RST,
         .pclk_hz = 80 * 1000 * 1000,
-        .width = DISPLAY_WIDTH,
-        .height = DISPLAY_HEIGHT,
+        .width = PORTRAIT_WIDTH,
+        .height = PORTRAIT_HEIGHT,
         .spi_host = SPI2_HOST,
     };
     
@@ -1098,7 +1107,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
     
     // Allocate draw buffer (needs to be big enough for JPEG MCU blocks)
-    draw_buffer = heap_caps_malloc(DISPLAY_WIDTH * 16 * 2, MALLOC_CAP_DMA);
+    draw_buffer = heap_caps_malloc(PORTRAIT_WIDTH * 16 * 2, MALLOC_CAP_DMA);
     if (!draw_buffer) {
         ESP_LOGE(TAG, "Failed to allocate draw buffer!");
         return;
@@ -1115,10 +1124,10 @@ void app_main(void)
         .i2c_addr = 0x38,
         .int_gpio = PIN_TOUCH_INT,
         .rst_gpio = -1,
-        .width = DISPLAY_WIDTH,
-        .height = DISPLAY_HEIGHT,
-        .swap_xy = true,
-        .invert_x = true,
+        .width = PORTRAIT_WIDTH,
+        .height = PORTRAIT_HEIGHT,
+        .swap_xy = false, // Portrait, no swap
+        .invert_x = false,
         .invert_y = false,
     };
     
@@ -1198,5 +1207,17 @@ void app_main(void)
         
         // Sleep to avoid busy-waiting
         vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h) {
+    for (uint16_t y = 0; y < src_h; y++) {
+        for (uint16_t x = 0; x < src_w; x++) {
+            int src_idx = (y * src_w + x) * 3;
+            int dst_idx = ((src_w - 1 - x) * src_h + y) * 3;
+            dst[dst_idx + 0] = src[src_idx + 0];
+            dst[dst_idx + 1] = src[src_idx + 1];
+            dst[dst_idx + 2] = src[src_idx + 2];
+        }
     }
 }
