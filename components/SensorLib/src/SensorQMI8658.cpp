@@ -1,0 +1,3 @@
+#include "SensorQMI8658.hpp"
+#include "SensorWireHelper.h"
+// ...existing code from Repo-References/03_QMI8658/components/SensorLib/src/SensorQMI8658.cpp...
