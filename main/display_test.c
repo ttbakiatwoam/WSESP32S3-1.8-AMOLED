@@ -7,150 +7,27 @@
  */
 
 #include <stdio.h>
-#include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <ctype.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "driver/gpio.h"
-#include "driver/i2c.h"
-#include "driver/sdmmc_host.h"
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
-#include "rm67162_qspi.h"
-#include "esp_lcd_rm67162.h"
-#include "esp_lcd_panel_ops.h"
-#include "cst816t.h"
-#include "esp32s3/rom/tjpgd.h"
-#include "pngle.h"
-#include "gifdec.h"
-#include "esp_timer.h"
-#include "SensorQMI8658.hpp"
-// IMU globals
-static SensorQMI8658 imu;
-static int last_orientation = 0; // 0=portrait, 1=landscape, 2=reverse portrait, 3=reverse landscape
-// IMU orientation task
-void imu_orientation_task(void *pvParameters) {
-    IMUdata acc;
-    while (1) {
-        imu.getAccel(&acc.x, &acc.y, &acc.z);
-        int orientation = 0;
-        if (fabs(acc.x) > fabs(acc.y)) {
-            orientation = (acc.x > 0) ? 1 : 3; // landscape or reverse landscape
-        } else {
-            orientation = (acc.y > 0) ? 0 : 2; // portrait or reverse portrait
-        }
-        if (orientation != last_orientation) {
-            last_orientation = orientation;
-            switch (orientation) {
-                case 0: // portrait
-                    esp_lcd_panel_swap_xy(panel_handle, true);
-                    esp_lcd_panel_mirror(panel_handle, false, true);
-                    break;
-                case 1: // landscape
-                    esp_lcd_panel_swap_xy(panel_handle, false);
-                    esp_lcd_panel_mirror(panel_handle, false, false);
-                    break;
-                case 2: // reverse portrait
-                    esp_lcd_panel_swap_xy(panel_handle, true);
-                    esp_lcd_panel_mirror(panel_handle, true, false);
-                    break;
-                case 3: // reverse landscape
-                    esp_lcd_panel_swap_xy(panel_handle, false);
-                    esp_lcd_panel_mirror(panel_handle, true, true);
-                    break;
-            }
-            ESP_LOGI(TAG, "Orientation changed: %d", orientation);
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-}
+// Shared types, enums, and statics
+#include "display_test_shared.h"
 
-static const char *TAG = "sd_image_test";
-
-// Forward declaration for JPEG rotation helper
-void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h);
-
-// Waveshare 1.8" AMOLED pin definitions
-#define PIN_LCD_CS      12
-#define PIN_LCD_SCK     11
-#define PIN_LCD_D0      4
-#define PIN_LCD_D1      5
-#define PIN_LCD_D2      6
-#define PIN_LCD_D3      7
-#define PIN_LCD_RST     13
-
-#define PORTRAIT_WIDTH   368
-#define PORTRAIT_HEIGHT  448
-
-// I2C pins for TCA9554 GPIO expander and CST816T touch
-#define PIN_I2C_SCL     14
-#define PIN_I2C_SDA     15
-#define I2C_MASTER_NUM  I2C_NUM_0
-#define I2C_FREQ_HZ     400000
-
-// Touch pins
-#define PIN_TOUCH_INT   21
-
-// TCA9554 I2C address
-#define TCA9554_ADDR    0x20
-
-// SD Card SDMMC 1-bit mode pins
-#define PIN_SD_CLK      2
-#define PIN_SD_CMD      1
-#define PIN_SD_DATA     3
-
-// Mount point for SD card
-#define MOUNT_POINT     "/sdcard"
-#define IMAGES_DIR      "/sdcard/images"
-
-// Maximum number of images to track
-#define MAX_IMAGES      64
-#define MAX_PATH_LEN    280
-
-// Image types
-typedef enum {
-    IMG_TYPE_UNKNOWN,
-    IMG_TYPE_BIN,
-    IMG_TYPE_JPEG,
-    IMG_TYPE_PNG,
-    IMG_TYPE_GIF
-} image_type_t;
-
-// Image list
-static char image_paths[MAX_IMAGES][MAX_PATH_LEN];
-static int num_images = 0;
-static int current_image = 0;
-
-static esp_lcd_panel_handle_t panel_handle = NULL;
-static uint16_t *draw_buffer = NULL;
-static sdmmc_card_t *sd_card = NULL;
-static bool use_images = false;
-static bool sd_mounted = false;
-static cst816t_handle_t global_touch_handle = NULL;  // For GIF animation touch detection
-static bool stop_animation = false;
-static bool animation_running = false;
-
-// Double-buffering for seamless image transitions
-#define IMAGE_BUFFER_COUNT 2
-static uint8_t *image_buffers[IMAGE_BUFFER_COUNT] = {NULL, NULL};
-static int active_image_buffer = 0;
-static int preload_image_index = -1;
-static bool preload_ready = false;
-static SemaphoreHandle_t preload_mutex = NULL;
-
-// Touch gesture events
-typedef enum {
-    TOUCH_EVENT_NONE = 0,
-    TOUCH_EVENT_TAP,
-    TOUCH_EVENT_DOUBLE_TAP,
-    TOUCH_EVENT_LONG_PRESS
-} touch_event_t;
-
-static volatile touch_event_t pending_touch_event = TOUCH_EVENT_NONE;
+// Provide storage for shared statics (only one definition, rest are extern in header)
+char image_paths[MAX_IMAGES][MAX_PATH_LEN];
+int num_images = 0;
+int current_image = 0;
+esp_lcd_panel_handle_t panel_handle = NULL;
+uint16_t *draw_buffer = NULL;
+sdmmc_card_t *sd_card = NULL;
+bool use_images = false;
+bool sd_mounted = false;
+cst816t_handle_t global_touch_handle = NULL;
+bool stop_animation = false;
+bool animation_running = false;
+uint8_t *image_buffers[IMAGE_BUFFER_COUNT] = {NULL, NULL};
+int active_image_buffer = 0;
+int preload_image_index = -1;
+bool preload_ready = false;
+SemaphoreHandle_t preload_mutex = NULL;
+volatile touch_event_t pending_touch_event = TOUCH_EVENT_NONE;
 
 // Forward declarations
 static int scan_for_images(void);
@@ -447,7 +324,7 @@ static esp_err_t display_jpeg(const char *path)
     
     // Allocate work buffer for TJPGD (needs about 3100 bytes minimum)
     #define TJPGD_WORK_BUF_SIZE 4096
-    uint8_t *work_buf = heap_caps_malloc(TJPGD_WORK_BUF_SIZE, MALLOC_CAP_DEFAULT);
+    uint8_t *work_buf = (uint8_t*)heap_caps_malloc(TJPGD_WORK_BUF_SIZE, MALLOC_CAP_DEFAULT);
     if (!work_buf) {
         ESP_LOGE(TAG, "Failed to allocate TJPGD work buffer");
         fclose(fp);
@@ -491,9 +368,9 @@ static esp_err_t display_jpeg(const char *path)
     if (needs_software_scale) {
         // Decode to buffer then software scale
         size_t buf_size = scaled_w * scaled_h * 3;
-        uint8_t *jpeg_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        uint8_t *jpeg_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!jpeg_buf) {
-            jpeg_buf = heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
+            jpeg_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
         }
         
         if (jpeg_buf) {
@@ -512,8 +389,8 @@ static esp_err_t display_jpeg(const char *path)
                 // Clear screen
                 fill_screen_color(0x0000);
                 // Rotate buffer 90 CCW
-                uint8_t *rot_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (!rot_buf) rot_buf = heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
+                uint8_t *rot_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (!rot_buf) rot_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
                 if (rot_buf) {
                     rotate_rgb888_90ccw(jpeg_buf, rot_buf, scaled_w, scaled_h);
                     scale_and_draw_rgb888(rot_buf, scaled_h, scaled_w); // Note: w/h swapped after rotation
@@ -628,10 +505,10 @@ static void pngle_init_callback(pngle_t *pngle, uint32_t w, uint32_t h)
              (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     
     // Allocate frame buffer (RGB888)
-    png_ctx.frame_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    png_ctx.frame_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!png_ctx.frame_buf) {
         // Try regular RAM if PSRAM not available
-        png_ctx.frame_buf = heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
+        png_ctx.frame_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
     }
     if (png_ctx.frame_buf) {
         memset(png_ctx.frame_buf, 0, buf_size);  // Black background
@@ -737,9 +614,9 @@ static esp_err_t display_gif(const char *path)
     
     // Allocate frame buffer (RGB888) - try PSRAM first
     size_t frame_size = gif->width * gif->height * 3;
-    uint8_t *frame = heap_caps_malloc(frame_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *frame = (uint8_t*)heap_caps_malloc(frame_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!frame) {
-        frame = heap_caps_malloc(frame_size, MALLOC_CAP_DEFAULT);
+        frame = (uint8_t*)heap_caps_malloc(frame_size, MALLOC_CAP_DEFAULT);
     }
     if (!frame) {
         ESP_LOGE(TAG, "Failed to allocate GIF frame buffer");
@@ -1000,7 +877,7 @@ static uint8_t* decode_image_to_buffer(const char *path, uint16_t *out_w, uint16
         // For now, just simulate
         *out_w = PORTRAIT_WIDTH;
         *out_h = PORTRAIT_HEIGHT;
-        uint8_t *buf = heap_caps_malloc(PORTRAIT_WIDTH * PORTRAIT_HEIGHT * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        uint8_t *buf = (uint8_t*)heap_caps_malloc(PORTRAIT_WIDTH * PORTRAIT_HEIGHT * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (buf) memset(buf, 0xFF, PORTRAIT_WIDTH * PORTRAIT_HEIGHT * 3); // White image
         return buf;
     }
@@ -1151,219 +1028,7 @@ static void touch_task(void *pvParameters)
     }
 }
 
-void app_main(void)
-{
-    ESP_LOGI(TAG, "=========================================");
-    ESP_LOGI(TAG, "  SD Card Image Display Test");
-    ESP_LOGI(TAG, "  Supports: JPEG, PNG, GIF, BIN");
-    ESP_LOGI(TAG, "  Waveshare ESP32-S3 1.8\" AMOLED");
-    ESP_LOGI(TAG, "=========================================");
-    // Set global log level to verbose for debugging
-    esp_log_level_set("*", ESP_LOG_VERBOSE);
-    
-    // Initialize I2C
-    ESP_LOGI(TAG, "Initializing I2C...");
-    i2c_config_t i2c_conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = PIN_I2C_SDA,
-        .scl_io_num = PIN_I2C_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
-    };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &i2c_conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, I2C_MODE_MASTER, 0, 0, 0));
 
-    // Initialize QMI8658 IMU
-    if (!imu.begin(I2C_MASTER_NUM, 0x6B, PIN_I2C_SDA, PIN_I2C_SCL)) {
-        ESP_LOGE(TAG, "QMI8658 IMU not found!");
-    } else {
-        ESP_LOGI(TAG, "QMI8658 IMU initialized, chip ID: 0x%02X", imu.getChipID());
-        imu.configAccelerometer(SensorQMI8658::ACC_RANGE_4G, SensorQMI8658::ACC_ODR_250Hz, SensorQMI8658::LPF_MODE_0, true);
-        imu.configGyroscope(SensorQMI8658::GYR_RANGE_256DPS, SensorQMI8658::GYR_ODR_224_2Hz, SensorQMI8658::LPF_MODE_0, true);
-        xTaskCreatePinnedToCore(imu_orientation_task, "imu_orientation_task", 4096, NULL, 5, NULL, 0);
-    }
-    
-    // TCA9554 pin masks
-    #define PIN_MASK_0  (1 << 0)
-    #define PIN_MASK_1  (1 << 1)
-    #define PIN_MASK_2  (1 << 2)
-    #define PIN_MASK_7  (1 << 7)
-    
-    // Configure TCA9554
-    ESP_LOGI(TAG, "Configuring TCA9554...");
-    uint8_t output_pins = PIN_MASK_0 | PIN_MASK_1 | PIN_MASK_2 | PIN_MASK_7;
-    ESP_ERROR_CHECK(tca9554_set_pin_direction(output_pins, true));
-    ESP_ERROR_CHECK(tca9554_set_pin_level(output_pins, false));
-    vTaskDelay(pdMS_TO_TICKS(200));
-    ESP_ERROR_CHECK(tca9554_set_pin_level(output_pins, true));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Initialize display
-    void *qspi_ctx = NULL;
-    rm67162_qspi_config_t qspi_config = {
-        .cs_gpio = PIN_LCD_CS,
-        .sck_gpio = PIN_LCD_SCK,
-        .d0_gpio = PIN_LCD_D0,
-        .d1_gpio = PIN_LCD_D1,
-        .d2_gpio = PIN_LCD_D2,
-        .d3_gpio = PIN_LCD_D3,
-        .reset_gpio = PIN_LCD_RST,
-        .pclk_hz = 80 * 1000 * 1000,
-        .width = PORTRAIT_WIDTH,
-        .height = PORTRAIT_HEIGHT,
-        .spi_host = SPI2_HOST,
-    };
-    
-    ESP_LOGI(TAG, "Initializing display...");
-    ESP_ERROR_CHECK(rm67162_qspi_init(&qspi_config, &qspi_ctx, &panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    
-    // Set display rotation (90° counter-clockwise, alternate mirror)
-    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
-    
-    // Allocate draw buffer (needs to be big enough for JPEG MCU blocks)
-    draw_buffer = heap_caps_malloc(PORTRAIT_WIDTH * 16 * 2, MALLOC_CAP_DMA);
-    if (!draw_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate draw buffer!");
-        return;
-    }
-
-    ESP_LOGI(TAG, "Display initialized! Forcing white fill to test display...");
-    fill_screen_color(0xFFFF); // White
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // Touch controller: add power-on delay and diagnostics
-    ESP_LOGI(TAG, "Waiting 200ms before initializing touch controller...");
-    vTaskDelay(pdMS_TO_TICKS(200));
-    ESP_LOGI(TAG, "Initializing touch...");
-    cst816t_config_t touch_config = {
-        .i2c_port = I2C_MASTER_NUM,
-        .i2c_addr = 0x38,
-        .int_gpio = PIN_TOUCH_INT,
-        .rst_gpio = -1, // WARNING: rst_gpio is -1, no hardware reset will be performed!
-        .width = PORTRAIT_WIDTH,
-        .height = PORTRAIT_HEIGHT,
-        .swap_xy = false, // Portrait, no swap
-        .invert_x = false,
-        .invert_y = false,
-    };
-
-    if (touch_config.rst_gpio == -1) {
-        ESP_LOGW(TAG, "Touch config: rst_gpio is -1, hardware reset will NOT be performed. If your module has a reset pin, set it here!");
-    }
-
-    cst816t_handle_t touch_handle = NULL;
-    esp_err_t touch_ret = cst816t_init(&touch_config, &touch_handle);
-    if (touch_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Touch init failed (err=0x%x), continuing without touch", touch_ret);
-    } else {
-        // Try to read chip ID for diagnostics
-        uint8_t chip_id = 0;
-        if (cst816t_get_chip_id(touch_handle, &chip_id) == ESP_OK) {
-            ESP_LOGI(TAG, "CST816T chip ID: 0x%02X", chip_id);
-        } else {
-            ESP_LOGW(TAG, "Failed to read CST816T chip ID after init");
-        }
-    }
-
-    // Set global touch handle for use in animations
-    global_touch_handle = touch_handle;
-
-    // Create dedicated touch task for responsive input
-    if (touch_handle) {
-        xTaskCreatePinnedToCore(
-            touch_task,           // Task function
-            "touch_task",         // Name
-            8192,                 // Stack size (increased)
-            touch_handle,         // Parameters
-            5,                    // Priority (higher than default)
-            NULL,                 // Task handle
-            0                     // Core 0 (only core in unicore mode)
-        );
-        ESP_LOGI(TAG, "Touch task created");
-    }
-    #warning "You are using the old I2C driver. Please migrate to driver/i2c_master.h and update your code to use the new I2C master API."
-    
-    // Initialize SD card
-    bool sd_ok = (init_sd_card() == ESP_OK);
-    
-    if (sd_ok) {
-        int found = scan_for_images();
-        if (found > 0) {
-            use_images = true;
-            ESP_LOGI(TAG, "=========================================");
-            ESP_LOGI(TAG, "  Found %d images!", found);
-            ESP_LOGI(TAG, "  Tap: next image | Long press: unmount SD");
-            ESP_LOGI(TAG, "  Double-tap: remount SD card");
-            ESP_LOGI(TAG, "=========================================");
-            
-            current_image = 0;
-            display_image(image_paths[current_image]);
-        }
-    }
-    
-    if (!use_images) {
-        ESP_LOGI(TAG, "No images found on SD card");
-        fill_screen_color(0xFFE0);  // Yellow - no images
-    }
-    
-    // Create mutex for double-buffering
-    preload_mutex = xSemaphoreCreateMutex();
-    if (!preload_mutex) {
-        ESP_LOGE(TAG, "Failed to create preload_mutex!");
-    }
-    // Start preload task for double-buffering
-    xTaskCreatePinnedToCore(
-        preload_task,           // Task function
-        "preload_task",        // Name
-        8192,                  // Stack size
-        NULL,                  // Parameters
-        5,                     // Priority
-        NULL,                  // Task handle
-        0                      // Core 0
-    );
-    ESP_LOGI(TAG, "Preload task created");
-    
-    // Main loop - handle touch events from background task
-    while (1) {
-        // Check for touch events from the touch task
-        touch_event_t event = pending_touch_event;
-
-        if (event != TOUCH_EVENT_NONE) {
-            ESP_LOGI(TAG, "Main loop: received event %d", event);
-            // Clear the event
-            pending_touch_event = TOUCH_EVENT_NONE;
-
-            // Handle the event
-            switch (event) {
-                case TOUCH_EVENT_TAP:
-                    ESP_LOGI(TAG, "Main loop: handling TAP");
-                    show_next_content(NULL);
-                    break;
-
-                case TOUCH_EVENT_DOUBLE_TAP:
-                    ESP_LOGI(TAG, "Main loop: handling DOUBLE TAP");
-                    remount_sd_card();
-                    break;
-
-                case TOUCH_EVENT_LONG_PRESS:
-                    ESP_LOGI(TAG, "Main loop: handling LONG PRESS");
-                    unmount_sd_card();
-                    break;
-
-                default:
-                    ESP_LOGI(TAG, "Main loop: unknown event");
-                    break;
-            }
-        }
-
-        // Sleep to avoid busy-waiting
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
 
 void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h) {
     for (uint16_t y = 0; y < src_h; y++) {
