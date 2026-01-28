@@ -28,6 +28,46 @@
 #include "pngle.h"
 #include "gifdec.h"
 #include "esp_timer.h"
+#include "SensorQMI8658.hpp"
+// IMU globals
+static SensorQMI8658 imu;
+static int last_orientation = 0; // 0=portrait, 1=landscape, 2=reverse portrait, 3=reverse landscape
+// IMU orientation task
+void imu_orientation_task(void *pvParameters) {
+    IMUdata acc;
+    while (1) {
+        imu.getAccel(&acc.x, &acc.y, &acc.z);
+        int orientation = 0;
+        if (fabs(acc.x) > fabs(acc.y)) {
+            orientation = (acc.x > 0) ? 1 : 3; // landscape or reverse landscape
+        } else {
+            orientation = (acc.y > 0) ? 0 : 2; // portrait or reverse portrait
+        }
+        if (orientation != last_orientation) {
+            last_orientation = orientation;
+            switch (orientation) {
+                case 0: // portrait
+                    esp_lcd_panel_swap_xy(panel_handle, true);
+                    esp_lcd_panel_mirror(panel_handle, false, true);
+                    break;
+                case 1: // landscape
+                    esp_lcd_panel_swap_xy(panel_handle, false);
+                    esp_lcd_panel_mirror(panel_handle, false, false);
+                    break;
+                case 2: // reverse portrait
+                    esp_lcd_panel_swap_xy(panel_handle, true);
+                    esp_lcd_panel_mirror(panel_handle, true, false);
+                    break;
+                case 3: // reverse landscape
+                    esp_lcd_panel_swap_xy(panel_handle, false);
+                    esp_lcd_panel_mirror(panel_handle, true, true);
+                    break;
+            }
+            ESP_LOGI(TAG, "Orientation changed: %d", orientation);
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
 
 static const char *TAG = "sd_image_test";
 
@@ -1133,6 +1173,16 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &i2c_conf));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, I2C_MODE_MASTER, 0, 0, 0));
+
+    // Initialize QMI8658 IMU
+    if (!imu.begin(I2C_MASTER_NUM, 0x6B, PIN_I2C_SDA, PIN_I2C_SCL)) {
+        ESP_LOGE(TAG, "QMI8658 IMU not found!");
+    } else {
+        ESP_LOGI(TAG, "QMI8658 IMU initialized, chip ID: 0x%02X", imu.getChipID());
+        imu.configAccelerometer(SensorQMI8658::ACC_RANGE_4G, SensorQMI8658::ACC_ODR_250Hz, SensorQMI8658::LPF_MODE_0, true);
+        imu.configGyroscope(SensorQMI8658::GYR_RANGE_256DPS, SensorQMI8658::GYR_ODR_224_2Hz, SensorQMI8658::LPF_MODE_0, true);
+        xTaskCreatePinnedToCore(imu_orientation_task, "imu_orientation_task", 4096, NULL, 5, NULL, 0);
+    }
     
     // TCA9554 pin masks
     #define PIN_MASK_0  (1 << 0)
