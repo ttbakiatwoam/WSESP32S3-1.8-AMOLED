@@ -97,6 +97,7 @@ static void imu_orientation_task(void *pvParameters) {
                         esp_lcd_panel_mirror(panel_handle, true, true);
                         break;
                 }
+                orientation_changed = true;
             }
             ESP_LOGI("imu", "Orientation changed: %d", orientation);
         }
@@ -299,8 +300,17 @@ extern "C" void app_main(void)
     );
     ESP_LOGI(TAG, "Preload task created");
 
-    // Main loop - handle touch events
+    // Main loop - handle touch events and orientation changes
     while (1) {
+        // Check for orientation change — redraw current image
+        if (orientation_changed) {
+            orientation_changed = false;
+            ESP_LOGI(TAG, "Orientation changed — redrawing current content");
+            if (use_images && num_images > 0 && !animation_running) {
+                display_image(image_paths[current_image]);
+            }
+        }
+
         touch_event_t event = pending_touch_event;
         if (event != TOUCH_EVENT_NONE) {
             ESP_LOGI(TAG, "Main loop: received event %d", event);

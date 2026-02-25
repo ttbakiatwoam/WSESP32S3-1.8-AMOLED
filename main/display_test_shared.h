@@ -78,6 +78,7 @@ extern bool sd_mounted;
 extern cst816t_handle_t global_touch_handle;
 extern bool stop_animation;
 extern bool animation_running;
+extern volatile bool orientation_changed;
 extern uint8_t *image_buffers[IMAGE_BUFFER_COUNT];
 extern int active_image_buffer;
 extern int preload_image_index;

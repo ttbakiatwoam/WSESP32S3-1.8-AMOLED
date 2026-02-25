@@ -22,6 +22,7 @@ bool sd_mounted = false;
 cst816t_handle_t global_touch_handle = NULL;
 bool stop_animation = false;
 bool animation_running = false;
+volatile bool orientation_changed = false;
 uint8_t *image_buffers[IMAGE_BUFFER_COUNT] = {NULL, NULL};
 int active_image_buffer = 0;
 int preload_image_index = -1;
@@ -654,6 +655,12 @@ static esp_err_t display_gif(const char *path)
             if (pending_touch_event == TOUCH_EVENT_TAP || pending_touch_event == TOUCH_EVENT_DOUBLE_TAP || pending_touch_event == TOUCH_EVENT_LONG_PRESS) {
                 stop_animation = true;
                 break;
+            }
+            // Check for orientation change — clear screen before next frame
+            if (orientation_changed) {
+                orientation_changed = false;
+                fill_screen_color(0x0000);
+                ESP_LOGI(TAG, "GIF: orientation changed, cleared screen");
             }
             vTaskDelay(pdMS_TO_TICKS(20));
             elapsed += 20;
