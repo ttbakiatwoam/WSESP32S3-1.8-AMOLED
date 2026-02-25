@@ -23,6 +23,7 @@ cst816t_handle_t global_touch_handle = NULL;
 bool stop_animation = false;
 bool animation_running = false;
 volatile bool orientation_changed = false;
+volatile int current_orientation = 0;
 uint8_t *image_buffers[IMAGE_BUFFER_COUNT] = {NULL, NULL};
 int active_image_buffer = 0;
 int preload_image_index = -1;
@@ -34,6 +35,8 @@ volatile touch_event_t pending_touch_event = TOUCH_EVENT_NONE;
 static int scan_for_images(void);
 static void touch_task(void *pvParameters);
 void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h);
+void rotate_rgb888_90cw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h);
+void rotate_rgb888_180(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h);
 
 // TCA9554 register addresses
 #define TCA9554_REG_OUTPUT   0x01
@@ -119,15 +122,29 @@ static inline uint16_t rgb888_to_rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (color >> 8) | (color << 8);
 }
 
+// Get effective display dimensions based on current orientation
+// Portrait (orientations 0, 2): 368w × 448h
+// Landscape (orientations 1, 3): 448w × 368h
+static void get_effective_display_size(uint16_t *eff_w, uint16_t *eff_h)
+{
+    if (current_orientation == 1 || current_orientation == 3) {
+        *eff_w = PORTRAIT_HEIGHT;  // 448
+        *eff_h = PORTRAIT_WIDTH;   // 368
+    } else {
+        *eff_w = PORTRAIT_WIDTH;   // 368
+        *eff_h = PORTRAIT_HEIGHT;  // 448
+    }
+}
+
 // Calculate scale to fit image in display while filling as much as possible
 // Returns scaled dimensions and offsets for centering
+// Uses effective display size based on current orientation
 static void calc_fit_scale(uint16_t src_w, uint16_t src_h, 
                            uint16_t *dst_w, uint16_t *dst_h,
                            int16_t *x_off, int16_t *y_off)
 {
-    // For portrait, use original display width/height
-    uint16_t disp_w = PORTRAIT_WIDTH;
-    uint16_t disp_h = PORTRAIT_HEIGHT;
+    uint16_t disp_w, disp_h;
+    get_effective_display_size(&disp_w, &disp_h);
     // Calculate scale factors (using fixed point 16.16 for precision)
     uint32_t scale_x = (disp_w << 16) / src_w;
     uint32_t scale_y = (disp_h << 16) / src_h;
@@ -140,7 +157,9 @@ static void calc_fit_scale(uint16_t src_w, uint16_t src_h,
     *y_off = (disp_h - *dst_h) / 2;
 }
 
-// Scale and draw RGB888 image to display with bilinear-ish interpolation
+// Scale and draw RGB888 image to display with orientation-aware rotation.
+// The image is first scaled for the effective display dimensions, then
+// rotated into the fixed 368×448 GRAM layout before drawing.
 static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h)
 {
     uint16_t dst_w, dst_h;
@@ -148,27 +167,111 @@ static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h)
     
     calc_fit_scale(src_w, src_h, &dst_w, &dst_h, &x_off, &y_off);
     
-    ESP_LOGI(TAG, "Scaling %dx%d -> %dx%d, offset (%d,%d)", 
-             src_w, src_h, dst_w, dst_h, x_off, y_off);
+    int orient = current_orientation;
     
-    // Fixed-point scale factors (16.16)
+    ESP_LOGI(TAG, "Scaling %dx%d -> %dx%d, offset (%d,%d), orient=%d", 
+             src_w, src_h, dst_w, dst_h, x_off, y_off, orient);
+    
+    // For orientation 0 (default portrait), draw directly — no rotation needed
+    if (orient == 0) {
+        // Fixed-point scale factors (16.16)
+        uint32_t x_ratio = ((src_w - 1) << 16) / dst_w;
+        uint32_t y_ratio = ((src_h - 1) << 16) / dst_h;
+        for (uint16_t y = 0; y < dst_h; y++) {
+            for (uint16_t x = 0; x < dst_w; x++) {
+                uint32_t sx = (x * x_ratio) >> 16;
+                uint32_t sy = (y * y_ratio) >> 16;
+                if (sx >= src_w) sx = src_w - 1;
+                if (sy >= src_h) sy = src_h - 1;
+                int idx = (sy * src_w + sx) * 3;
+                draw_buffer[x] = rgb888_to_rgb565(src[idx], src[idx+1], src[idx+2]);
+            }
+            esp_lcd_panel_draw_bitmap(panel_handle, x_off, y_off + y, x_off + dst_w, y_off + y + 1, draw_buffer);
+        }
+        return;
+    }
+    
+    // For other orientations, scale into a temporary buffer then rotate into GRAM.
+    // Scale to (dst_w × dst_h) in the effective orientation coordinate space,
+    // then rotate so it maps correctly into the fixed 368×448 GRAM.
+    size_t scaled_size = dst_w * dst_h * 3;
+    uint8_t *scaled_buf = (uint8_t*)heap_caps_malloc(scaled_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scaled_buf) scaled_buf = (uint8_t*)heap_caps_malloc(scaled_size, MALLOC_CAP_DEFAULT);
+    if (!scaled_buf) {
+        ESP_LOGE(TAG, "Failed to allocate scaled buffer for rotation (%d bytes)", (int)scaled_size);
+        return;
+    }
+    
+    // Scale source into scaled_buf (orientation-sized)
     uint32_t x_ratio = ((src_w - 1) << 16) / dst_w;
     uint32_t y_ratio = ((src_h - 1) << 16) / dst_h;
-    // Draw scaled image directly (portrait)
     for (uint16_t y = 0; y < dst_h; y++) {
         for (uint16_t x = 0; x < dst_w; x++) {
-            uint32_t src_x = (x * x_ratio) >> 16;
-            uint32_t src_y = (y * y_ratio) >> 16;
-            if (src_x >= src_w) src_x = src_w - 1;
-            if (src_y >= src_h) src_y = src_h - 1;
-            int idx = (src_y * src_w + src_x) * 3;
-            uint8_t r = src[idx + 0];
-            uint8_t g = src[idx + 1];
-            uint8_t b = src[idx + 2];
-            draw_buffer[x] = rgb888_to_rgb565(r, g, b);
+            uint32_t sx = (x * x_ratio) >> 16;
+            uint32_t sy = (y * y_ratio) >> 16;
+            if (sx >= src_w) sx = src_w - 1;
+            if (sy >= src_h) sy = src_h - 1;
+            int src_idx = (sy * src_w + sx) * 3;
+            int dst_idx = (y * dst_w + x) * 3;
+            scaled_buf[dst_idx + 0] = src[src_idx + 0];
+            scaled_buf[dst_idx + 1] = src[src_idx + 1];
+            scaled_buf[dst_idx + 2] = src[src_idx + 2];
         }
-        esp_lcd_panel_draw_bitmap(panel_handle, x_off, y_off + y, x_off + dst_w, y_off + y + 1, draw_buffer);
     }
+    
+    // Determine rotated buffer dimensions and allocate
+    uint16_t rot_w, rot_h;
+    if (orient == 1 || orient == 3) {
+        rot_w = dst_h;  // landscape → portrait: swapped
+        rot_h = dst_w;
+    } else {
+        rot_w = dst_w;  // 180°: same dimensions
+        rot_h = dst_h;
+    }
+    
+    size_t rot_size = rot_w * rot_h * 3;
+    uint8_t *rot_buf = (uint8_t*)heap_caps_malloc(rot_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rot_buf) rot_buf = (uint8_t*)heap_caps_malloc(rot_size, MALLOC_CAP_DEFAULT);
+    if (!rot_buf) {
+        ESP_LOGE(TAG, "Failed to allocate rotation buffer (%d bytes)", (int)rot_size);
+        free(scaled_buf);
+        return;
+    }
+    
+    // Apply rotation
+    switch (orient) {
+        case 1:  // Device rotated 90° CW → rotate image 90° CW
+            rotate_rgb888_90cw(scaled_buf, rot_buf, dst_w, dst_h);
+            break;
+        case 2:  // Device rotated 180° → rotate image 180°
+            rotate_rgb888_180(scaled_buf, rot_buf, dst_w, dst_h);
+            break;
+        case 3:  // Device rotated 90° CCW → rotate image 90° CCW
+            rotate_rgb888_90ccw(scaled_buf, rot_buf, dst_w, dst_h);
+            break;
+        default:
+            break;
+    }
+    free(scaled_buf);
+    
+    // Calculate centering in the fixed 368×448 GRAM
+    int16_t gram_x = (PORTRAIT_WIDTH - rot_w) / 2;
+    int16_t gram_y = (PORTRAIT_HEIGHT - rot_h) / 2;
+    if (gram_x < 0) gram_x = 0;
+    if (gram_y < 0) gram_y = 0;
+    
+    // Draw the rotated buffer to GRAM
+    for (uint16_t y = 0; y < rot_h && (gram_y + y) < PORTRAIT_HEIGHT; y++) {
+        uint16_t draw_w = rot_w;
+        if (gram_x + draw_w > PORTRAIT_WIDTH) draw_w = PORTRAIT_WIDTH - gram_x;
+        for (uint16_t x = 0; x < draw_w; x++) {
+            int idx = (y * rot_w + x) * 3;
+            draw_buffer[x] = rgb888_to_rgb565(rot_buf[idx], rot_buf[idx+1], rot_buf[idx+2]);
+        }
+        esp_lcd_panel_draw_bitmap(panel_handle, gram_x, gram_y + y, gram_x + draw_w, gram_y + y + 1, draw_buffer);
+    }
+    
+    free(rot_buf);
 }
 
 // TJPGD decoder context
@@ -351,84 +454,44 @@ static esp_err_t display_jpeg(const char *path)
     
     ESP_LOGI(TAG, "JPEG original: %dx%d", jdec.width, jdec.height);
     
-    // For large images: use TJPGD scaling (1/2, 1/4, 1/8) to fit in display
-    // For small images: decode at full size, then we'll need software upscaling
+    // Use TJPGD scaling (1/2, 1/4, 1/8) to fit reasonable size
     uint8_t scale = 0;
     uint16_t scaled_w = jdec.width;
     uint16_t scaled_h = jdec.height;
     
-    // Scale down if too large for display
-    while ((scaled_w > PORTRAIT_WIDTH || scaled_h > PORTRAIT_HEIGHT) && scale < 3) {
+    // Use the larger dimension for scale-down check (landscape support)
+    uint16_t max_dim = (PORTRAIT_WIDTH > PORTRAIT_HEIGHT) ? PORTRAIT_WIDTH : PORTRAIT_HEIGHT;
+    while ((scaled_w > max_dim || scaled_h > max_dim) && scale < 3) {
         scale++;
         scaled_w = jdec.width >> scale;
         scaled_h = jdec.height >> scale;
     }
     
-    // Check if this is a small image that would benefit from upscaling
-    bool needs_software_scale = (scaled_w < PORTRAIT_WIDTH * 0.7 && scaled_h < PORTRAIT_HEIGHT * 0.7);
-    
-    if (needs_software_scale) {
-        // Decode to buffer then software scale
-        size_t buf_size = scaled_w * scaled_h * 3;
-        uint8_t *jpeg_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!jpeg_buf) {
-            jpeg_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
-        }
-        
-        if (jpeg_buf) {
-            ESP_LOGI(TAG, "Small JPEG - decoding to buffer for upscaling");
-            
-            // Setup context for buffer capture
-            tjpgd_ctx.x_offset = -1;  // Signal to capture to buffer
-            tjpgd_ctx.y_offset = 0;
-            tjpgd_ctx.work_buf = jpeg_buf;  // Reuse pointer to store output buffer
-            tjpgd_ctx.out_w = scaled_w;
-            tjpgd_ctx.out_h = scaled_h;
-            
-            res = jd_decomp(&jdec, tjpgd_output_func, scale);
-            
-            if (res == JDR_OK) {
-                // Clear screen
-                fill_screen_color(0x0000);
-                // Rotate buffer 90 CCW
-                uint8_t *rot_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (!rot_buf) rot_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
-                if (rot_buf) {
-                    rotate_rgb888_90ccw(jpeg_buf, rot_buf, scaled_w, scaled_h);
-                    scale_and_draw_rgb888(rot_buf, scaled_h, scaled_w); // Note: w/h swapped after rotation
-                    free(rot_buf);
-                } else {
-                    scale_and_draw_rgb888(jpeg_buf, scaled_w, scaled_h);
-                }
-            }
-            
-            free(jpeg_buf);
-            free(work_buf);
-            fclose(fp);
-            
-            if (res != JDR_OK) {
-                ESP_LOGE(TAG, "JPEG decompress failed: %d", res);
-                return ESP_FAIL;
-            }
-            
-            ESP_LOGI(TAG, "JPEG decoded and upscaled successfully");
-            return ESP_OK;
-        } else {
-            needs_software_scale = false;
-        }
+    // Always decode to a full RGB888 buffer (required for orientation rotation)
+    size_t buf_size = scaled_w * scaled_h * 3;
+    uint8_t *jpeg_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!jpeg_buf) {
+        jpeg_buf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DEFAULT);
+    }
+    if (!jpeg_buf) {
+        ESP_LOGE(TAG, "Failed to allocate JPEG buffer (%d bytes)", (int)buf_size);
+        free(work_buf);
+        fclose(fp);
+        return ESP_ERR_NO_MEM;
     }
     
-    // Calculate centering offsets for direct decode to display
-    tjpgd_ctx.x_offset = (PORTRAIT_WIDTH - scaled_w) / 2;
-    tjpgd_ctx.y_offset = (PORTRAIT_HEIGHT - scaled_h) / 2;
+    memset(jpeg_buf, 0, buf_size);
     
-    ESP_LOGI(TAG, "JPEG scaled: %dx%d (scale=1/%d, offset=%d,%d)", 
-             scaled_w, scaled_h, 1 << scale, tjpgd_ctx.x_offset, tjpgd_ctx.y_offset);
+    ESP_LOGI(TAG, "JPEG decoding to buffer: %dx%d (scale=1/%d, %d bytes)", 
+             scaled_w, scaled_h, 1 << scale, (int)buf_size);
     
-    // Clear screen before drawing (black background)
-    fill_screen_color(0x0000);
+    // Setup context for buffer capture
+    tjpgd_ctx.x_offset = -1;  // Signal to capture to buffer
+    tjpgd_ctx.y_offset = 0;
+    tjpgd_ctx.work_buf = jpeg_buf;
+    tjpgd_ctx.out_w = scaled_w;
+    tjpgd_ctx.out_h = scaled_h;
     
-    // Decompress the image with scaling
     res = jd_decomp(&jdec, tjpgd_output_func, scale);
     
     free(work_buf);
@@ -436,8 +499,13 @@ static esp_err_t display_jpeg(const char *path)
     
     if (res != JDR_OK) {
         ESP_LOGE(TAG, "JPEG decompress failed: %d", res);
+        free(jpeg_buf);
         return ESP_FAIL;
     }
+    
+    // scale_and_draw_rgb888 handles orientation rotation internally
+    scale_and_draw_rgb888(jpeg_buf, scaled_w, scaled_h);
+    free(jpeg_buf);
     
     ESP_LOGI(TAG, "JPEG decoded successfully");
     return ESP_OK;
@@ -1039,6 +1107,7 @@ static void touch_task(void *pvParameters)
 
 
 void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h) {
+    // Output is src_h wide × src_w tall
     for (uint16_t y = 0; y < src_h; y++) {
         for (uint16_t x = 0; x < src_w; x++) {
             int src_idx = (y * src_w + x) * 3;
@@ -1047,5 +1116,29 @@ void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t sr
             dst[dst_idx + 1] = src[src_idx + 1];
             dst[dst_idx + 2] = src[src_idx + 2];
         }
+    }
+}
+
+void rotate_rgb888_90cw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h) {
+    // Output is src_h wide × src_w tall
+    for (uint16_t y = 0; y < src_h; y++) {
+        for (uint16_t x = 0; x < src_w; x++) {
+            int src_idx = (y * src_w + x) * 3;
+            int dst_idx = (x * src_h + (src_h - 1 - y)) * 3;
+            dst[dst_idx + 0] = src[src_idx + 0];
+            dst[dst_idx + 1] = src[src_idx + 1];
+            dst[dst_idx + 2] = src[src_idx + 2];
+        }
+    }
+}
+
+void rotate_rgb888_180(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h) {
+    // Output is same dimensions (src_w × src_h)
+    uint32_t total = (uint32_t)src_w * src_h;
+    for (uint32_t i = 0; i < total; i++) {
+        uint32_t j = total - 1 - i;
+        dst[j * 3 + 0] = src[i * 3 + 0];
+        dst[j * 3 + 1] = src[i * 3 + 1];
+        dst[j * 3 + 2] = src[i * 3 + 2];
     }
 }

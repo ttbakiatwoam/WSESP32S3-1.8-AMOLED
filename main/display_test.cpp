@@ -66,6 +66,7 @@ static SensorQMI8658 imu;
 static int last_orientation = 0;
 
 // IMU orientation task (C++ - uses imu object)
+// MADCTL is kept fixed; rotation is done in software when rendering images.
 static void imu_orientation_task(void *pvParameters) {
     float acc_x = 0, acc_y = 0, acc_z = 0;
     while (1) {
@@ -78,27 +79,8 @@ static void imu_orientation_task(void *pvParameters) {
         }
         if (orientation != last_orientation) {
             last_orientation = orientation;
-            if (panel_handle) {
-                switch (orientation) {
-                    case 0:
-                        esp_lcd_panel_swap_xy(panel_handle, true);
-                        esp_lcd_panel_mirror(panel_handle, false, true);
-                        break;
-                    case 1:
-                        esp_lcd_panel_swap_xy(panel_handle, false);
-                        esp_lcd_panel_mirror(panel_handle, false, false);
-                        break;
-                    case 2:
-                        esp_lcd_panel_swap_xy(panel_handle, true);
-                        esp_lcd_panel_mirror(panel_handle, true, false);
-                        break;
-                    case 3:
-                        esp_lcd_panel_swap_xy(panel_handle, false);
-                        esp_lcd_panel_mirror(panel_handle, true, true);
-                        break;
-                }
-                orientation_changed = true;
-            }
+            current_orientation = orientation;
+            orientation_changed = true;
             ESP_LOGI("imu", "Orientation changed: %d", orientation);
         }
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -215,8 +197,9 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
 
-    // Allocate draw buffer
-    draw_buffer = (uint16_t*)heap_caps_malloc(PORTRAIT_WIDTH * 16 * 2, MALLOC_CAP_DMA);
+    // Allocate draw buffer — use max dimension for landscape support
+    int max_dim = (PORTRAIT_WIDTH > PORTRAIT_HEIGHT) ? PORTRAIT_WIDTH : PORTRAIT_HEIGHT;
+    draw_buffer = (uint16_t*)heap_caps_malloc(max_dim * 16 * 2, MALLOC_CAP_DMA);
     if (!draw_buffer) {
         ESP_LOGE(TAG, "Failed to allocate draw buffer!");
         return;
