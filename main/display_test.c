@@ -23,7 +23,7 @@ cst816t_handle_t global_touch_handle = NULL;
 bool stop_animation = false;
 bool animation_running = false;
 volatile bool orientation_changed = false;
-volatile int current_orientation = 0;
+volatile int current_orientation = BASE_ORIENTATION;
 uint8_t *image_buffers[IMAGE_BUFFER_COUNT] = {NULL, NULL};
 int active_image_buffer = 0;
 int preload_image_index = -1;
@@ -122,12 +122,20 @@ static inline uint16_t rgb888_to_rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (color >> 8) | (color << 8);
 }
 
-// Get effective display dimensions based on current orientation
-// Portrait (orientations 0, 2): 368w × 448h
-// Landscape (orientations 1, 3): 448w × 368h
+// Get the rotation amount (0-3) relative to the base orientation.
+// 0 = no rotation, 1 = 90° CW, 2 = 180°, 3 = 90° CCW
+static int get_rotation(void)
+{
+    return (current_orientation - BASE_ORIENTATION + 4) % 4;
+}
+
+// Get effective display dimensions based on current rotation
+// Portrait (rotation 0, 2): 368w × 448h
+// Landscape (rotation 1, 3): 448w × 368h
 static void get_effective_display_size(uint16_t *eff_w, uint16_t *eff_h)
 {
-    if (current_orientation == 1 || current_orientation == 3) {
+    int rot = get_rotation();
+    if (rot == 1 || rot == 3) {
         *eff_w = PORTRAIT_HEIGHT;  // 448
         *eff_h = PORTRAIT_WIDTH;   // 368
     } else {
@@ -168,12 +176,13 @@ static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h)
     calc_fit_scale(src_w, src_h, &dst_w, &dst_h, &x_off, &y_off);
     
     int orient = current_orientation;
+    int rot = get_rotation();
     
-    ESP_LOGI(TAG, "Scaling %dx%d -> %dx%d, offset (%d,%d), orient=%d", 
-             src_w, src_h, dst_w, dst_h, x_off, y_off, orient);
+    ESP_LOGI(TAG, "Scaling %dx%d -> %dx%d, offset (%d,%d), orient=%d, rot=%d", 
+             src_w, src_h, dst_w, dst_h, x_off, y_off, orient, rot);
     
-    // For orientation 0 (default portrait), draw directly — no rotation needed
-    if (orient == 0) {
+    // For rotation 0 (base orientation), draw directly — no rotation needed
+    if (rot == 0) {
         // Fixed-point scale factors (16.16)
         uint32_t x_ratio = ((src_w - 1) << 16) / dst_w;
         uint32_t y_ratio = ((src_h - 1) << 16) / dst_h;
@@ -221,7 +230,7 @@ static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h)
     
     // Determine rotated buffer dimensions and allocate
     uint16_t rot_w, rot_h;
-    if (orient == 1 || orient == 3) {
+    if (rot == 1 || rot == 3) {
         rot_w = dst_h;  // landscape → portrait: swapped
         rot_h = dst_w;
     } else {
@@ -239,14 +248,14 @@ static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h)
     }
     
     // Apply rotation
-    switch (orient) {
-        case 1:  // Device rotated 90° CW → rotate image 90° CW
+    switch (rot) {
+        case 1:  // 90° CW
             rotate_rgb888_90cw(scaled_buf, rot_buf, dst_w, dst_h);
             break;
-        case 2:  // Device rotated 180° → rotate image 180°
+        case 2:  // 180°
             rotate_rgb888_180(scaled_buf, rot_buf, dst_w, dst_h);
             break;
-        case 3:  // Device rotated 90° CCW → rotate image 90° CCW
+        case 3:  // 90° CCW
             rotate_rgb888_90ccw(scaled_buf, rot_buf, dst_w, dst_h);
             break;
         default:

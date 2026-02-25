@@ -24,6 +24,12 @@ extern "C" {
 
 static const int PORTRAIT_WIDTH  = 368;
 static const int PORTRAIT_HEIGHT = 448;
+
+// Base orientation: the IMU orientation value when the device is held
+// in its "normal" upright position (matching the MADCTL config).
+// The QMI8658 reports orient=2 when the Waveshare 1.8" AMOLED is
+// held in its natural portrait orientation.
+#define BASE_ORIENTATION 2
 static const gpio_num_t PIN_SD_DATA  = GPIO_NUM_3;
 static const gpio_num_t PIN_SD_CLK   = GPIO_NUM_2;
 static const gpio_num_t PIN_SD_CMD   = GPIO_NUM_1;

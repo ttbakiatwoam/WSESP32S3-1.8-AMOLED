@@ -63,25 +63,30 @@ static inline void delay(unsigned long ms) {
 
 // C++ globals: IMU
 static SensorQMI8658 imu;
-static int last_orientation = 0;
+static int last_orientation = BASE_ORIENTATION;
 
 // IMU orientation task (C++ - uses imu object)
 // MADCTL is kept fixed; rotation is done in software when rendering images.
 static void imu_orientation_task(void *pvParameters) {
     float acc_x = 0, acc_y = 0, acc_z = 0;
+    const float THRESHOLD = 0.3f;  // Hysteresis threshold to prevent jitter
     while (1) {
         imu.getAccelerometer(acc_x, acc_y, acc_z);
-        int orientation = 0;
-        if (fabs(acc_x) > fabs(acc_y)) {
+        int orientation = last_orientation;  // Default: keep current
+        float ax = fabs(acc_x);
+        float ay = fabs(acc_y);
+        // Only change orientation if dominant axis exceeds threshold
+        if (ax > ay + THRESHOLD) {
             orientation = (acc_x > 0) ? 1 : 3;
-        } else {
+        } else if (ay > ax + THRESHOLD) {
             orientation = (acc_y > 0) ? 0 : 2;
         }
         if (orientation != last_orientation) {
             last_orientation = orientation;
             current_orientation = orientation;
             orientation_changed = true;
-            ESP_LOGI("imu", "Orientation changed: %d", orientation);
+            ESP_LOGI("imu", "Orientation changed: %d (rotation=%d)", 
+                     orientation, (orientation - BASE_ORIENTATION + 4) % 4);
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
