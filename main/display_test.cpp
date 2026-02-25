@@ -78,23 +78,25 @@ static void imu_orientation_task(void *pvParameters) {
         }
         if (orientation != last_orientation) {
             last_orientation = orientation;
-            switch (orientation) {
-                case 0:
-                    esp_lcd_panel_swap_xy(panel_handle, true);
-                    esp_lcd_panel_mirror(panel_handle, false, true);
-                    break;
-                case 1:
-                    esp_lcd_panel_swap_xy(panel_handle, false);
-                    esp_lcd_panel_mirror(panel_handle, false, false);
-                    break;
-                case 2:
-                    esp_lcd_panel_swap_xy(panel_handle, true);
-                    esp_lcd_panel_mirror(panel_handle, true, false);
-                    break;
-                case 3:
-                    esp_lcd_panel_swap_xy(panel_handle, false);
-                    esp_lcd_panel_mirror(panel_handle, true, true);
-                    break;
+            if (panel_handle) {
+                switch (orientation) {
+                    case 0:
+                        esp_lcd_panel_swap_xy(panel_handle, true);
+                        esp_lcd_panel_mirror(panel_handle, false, true);
+                        break;
+                    case 1:
+                        esp_lcd_panel_swap_xy(panel_handle, false);
+                        esp_lcd_panel_mirror(panel_handle, false, false);
+                        break;
+                    case 2:
+                        esp_lcd_panel_swap_xy(panel_handle, true);
+                        esp_lcd_panel_mirror(panel_handle, true, false);
+                        break;
+                    case 3:
+                        esp_lcd_panel_swap_xy(panel_handle, false);
+                        esp_lcd_panel_mirror(panel_handle, true, true);
+                        break;
+                }
             }
             ESP_LOGI("imu", "Orientation changed: %d", orientation);
         }
