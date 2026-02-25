@@ -69,7 +69,10 @@ static int last_orientation = BASE_ORIENTATION;
 // MADCTL is kept fixed; rotation is done in software when rendering images.
 static void imu_orientation_task(void *pvParameters) {
     float acc_x = 0, acc_y = 0, acc_z = 0;
-    const float THRESHOLD = 0.3f;  // Hysteresis threshold to prevent jitter
+    const float THRESHOLD = 0.4f;  // Hysteresis threshold to prevent jitter
+    int debounce_count = 0;
+    int pending_orientation = last_orientation;
+    const int DEBOUNCE_REQUIRED = 3;  // Need 3 consecutive consistent readings (~600ms)
     while (1) {
         imu.getAccelerometer(acc_x, acc_y, acc_z);
         int orientation = last_orientation;  // Default: keep current
@@ -79,14 +82,27 @@ static void imu_orientation_task(void *pvParameters) {
         if (ax > ay + THRESHOLD) {
             orientation = (acc_x > 0) ? 1 : 3;
         } else if (ay > ax + THRESHOLD) {
-            orientation = (acc_y > 0) ? 0 : 2;
+            orientation = (acc_y > 0) ? 2 : 0;
         }
+        // Debounce: require multiple consistent readings before committing change
         if (orientation != last_orientation) {
-            last_orientation = orientation;
-            current_orientation = orientation;
-            orientation_changed = true;
-            ESP_LOGI("imu", "Orientation changed: %d (rotation=%d)", 
-                     orientation, (orientation - BASE_ORIENTATION + 4) % 4);
+            if (orientation == pending_orientation) {
+                debounce_count++;
+            } else {
+                pending_orientation = orientation;
+                debounce_count = 1;
+            }
+            if (debounce_count >= DEBOUNCE_REQUIRED) {
+                last_orientation = orientation;
+                current_orientation = orientation;
+                orientation_changed = true;
+                debounce_count = 0;
+                ESP_LOGI("imu", "Orientation changed: %d (rotation=%d)", 
+                         orientation, (orientation - BASE_ORIENTATION + 4) % 4);
+            }
+        } else {
+            debounce_count = 0;
+            pending_orientation = last_orientation;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -174,6 +190,10 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "QMI8658 IMU initialized, chip ID: 0x%02X", imu.getChipID());
         imu.configAccelerometer(SensorQMI8658::ACC_RANGE_4G, SensorQMI8658::ACC_ODR_250Hz, SensorQMI8658::LPF_MODE_0, true);
         imu.configGyroscope(SensorQMI8658::GYR_RANGE_256DPS, SensorQMI8658::GYR_ODR_224_2Hz, SensorQMI8658::LPF_MODE_0, true);
+        imu.enableAccelerometer();
+        imu.enableGyroscope();
+        ESP_LOGI(TAG, "IMU accel enabled: %d, gyro enabled: %d",
+                 imu.isEnableAccelerometer(), imu.isEnableGyroscope());
         xTaskCreatePinnedToCore(imu_orientation_task, "imu_orientation_task", 4096, NULL, 5, NULL, 0);
     }
 
