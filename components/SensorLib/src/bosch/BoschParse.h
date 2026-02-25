@@ -2,7 +2,7 @@
  *
  * @license MIT License
  *
- * Copyright (c) 2023 lewis he
+ * Copyright (c) 2022 lewis he
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,25 +22,37 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  *
- * @file      SensorWireHelper.h
+ * @file      BoschParse.h
  * @author    Lewis He (lewishe@outlook.com)
- * @date      2023-09-10
+ * @date      2023-09-30
  *
  */
 #pragma once
 
-#if defined(ARDUINO)
-#include <Arduino.h>
-#include <Wire.h>
+#include "SensorCommon.tpp"
+#include "SensorBhy2Define.h"
+#include "bosch/bhy2_parse.h"
+#include "bosch/common/common.h"
+#include <vector>
+#include <functional>
 
-class SensorWireHelper
-{
-public:
-    static int regdump(TwoWire &w, Stream &serial, uint8_t devAddr, uint8_t start, uint8_t len);
-    static void dumpDevices(TwoWire &w, Stream &serial = Serial, int first = 0, int last = 127);
-    static void hexdump(uint8_t *data, size_t len, Stream &serial = Serial);
+
+enum BoschOrientation {
+    BHY2_DIRECTION_TOP_RIGHT,
+    BHY2_DIRECTION_TOP_LEFT,
+    BHY2_DIRECTION_BOTTOM_LEFT,
+    BHY2_DIRECTION_BOTTOM_RIGHT,
 };
 
-#endif /*ARDUINO*/
+class BoschParse
+{
+public:
+    static std::vector<SensorEventCbList_t> bhyEventVector;
+    static std::vector<ParseCallBackList_t> bhyParseEventVector;
 
+    static void parseData(const struct bhy2_fifo_parse_data_info *fifo, void *user_data);
 
+    static void parseMetaEvent(const struct bhy2_fifo_parse_data_info *callback_info, void *user_data);
+
+    static void parseDebugMessage(const struct bhy2_fifo_parse_data_info *callback_info, void *callback_ref);
+};

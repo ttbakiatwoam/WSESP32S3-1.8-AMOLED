@@ -2,7 +2,7 @@
  *
  * @license MIT License
  *
- * Copyright (c) 2023 lewis he
+ * Copyright (c) 2022 lewis he
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,25 +22,25 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  *
- * @file      SensorWireHelper.h
+ * @file      CSTxxxConstants.h
  * @author    Lewis He (lewishe@outlook.com)
- * @date      2023-09-10
+ * @date      2023-04-24
  *
  */
+
 #pragma once
 
-#if defined(ARDUINO)
-#include <Arduino.h>
-#include <Wire.h>
+#define CSTXXX_SLAVE_ADDRESS        (0x15)
+#define CST816_SLAVE_ADDRESS        (0x15)
+#define CST328_SLAVE_ADDRESS        (0x1A)
+#define CST226SE_SLAVE_ADDRESS      (0x5A)
 
-class SensorWireHelper
-{
-public:
-    static int regdump(TwoWire &w, Stream &serial, uint8_t devAddr, uint8_t start, uint8_t len);
-    static void dumpDevices(TwoWire &w, Stream &serial = Serial, int first = 0, int last = 127);
-    static void hexdump(uint8_t *data, size_t len, Stream &serial = Serial);
-};
+#define CST816S_CHIP_ID             (0xB4)
+#define CST816T_CHIP_ID             (0xB5)
+#define CST716_CHIP_ID              (0x20)
+#define CST226SE_CHIP_ID            (0xA8)
 
-#endif /*ARDUINO*/
+
+
 
 

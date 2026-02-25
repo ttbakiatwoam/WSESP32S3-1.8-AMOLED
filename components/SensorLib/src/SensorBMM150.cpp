@@ -2,7 +2,7 @@
  *
  * @license MIT License
  *
- * Copyright (c) 2023 lewis he
+ * Copyright (c) 2024 lewis he
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,25 +22,15 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  *
- * @file      SensorWireHelper.h
+ * @file      SensorBMM150.cpp
  * @author    Lewis He (lewishe@outlook.com)
- * @date      2023-09-10
+ * @date      2024-07-24
  *
  */
-#pragma once
+#include "SensorBMM150.hpp"
 
 #if defined(ARDUINO)
-#include <Arduino.h>
-#include <Wire.h>
-
-class SensorWireHelper
-{
-public:
-    static int regdump(TwoWire &w, Stream &serial, uint8_t devAddr, uint8_t start, uint8_t len);
-    static void dumpDevices(TwoWire &w, Stream &serial = Serial, int first = 0, int last = 127);
-    static void hexdump(uint8_t *data, size_t len, Stream &serial = Serial);
-};
-
-#endif /*ARDUINO*/
+volatile bool SensorBMM150::__data_available;
+#endif
 
 
