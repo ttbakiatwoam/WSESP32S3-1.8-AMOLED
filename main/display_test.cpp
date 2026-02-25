@@ -60,7 +60,6 @@ static inline void delay(unsigned long ms) {
 
 // Missing defines from original C app
 #define I2C_FREQ_HZ     400000
-#define PIN_TOUCH_INT   GPIO_NUM_21
 
 // C++ globals: IMU
 static SensorQMI8658 imu;
