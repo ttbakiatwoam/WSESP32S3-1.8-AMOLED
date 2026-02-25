@@ -36,3 +36,7 @@ venv
 /docs/banshee-docs
 .DS_Store
 Repo-References/*
+# Temp/junk files
+Archive.zip
+deleteme.html
+deleteme.*
