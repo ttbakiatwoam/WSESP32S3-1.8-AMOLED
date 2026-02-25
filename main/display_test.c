@@ -32,6 +32,7 @@ volatile touch_event_t pending_touch_event = TOUCH_EVENT_NONE;
 // Forward declarations
 static int scan_for_images(void);
 static void touch_task(void *pvParameters);
+void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h);
 
 // TCA9554 register addresses
 #define TCA9554_REG_OUTPUT   0x01
@@ -45,7 +46,7 @@ static esp_err_t tca9554_write_reg(uint8_t reg, uint8_t value)
     i2c_master_write_byte(cmd, reg, true);
     i2c_master_write_byte(cmd, value, true);
     i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
     i2c_cmd_link_delete(cmd);
     return ret;
 }
@@ -60,7 +61,7 @@ static esp_err_t tca9554_read_reg(uint8_t reg, uint8_t *value)
     i2c_master_write_byte(cmd, (TCA9554_ADDR << 1) | I2C_MASTER_READ, true);
     i2c_master_read_byte(cmd, value, I2C_MASTER_NACK);
     i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
     i2c_cmd_link_delete(cmd);
     return ret;
 }

@@ -25,10 +25,10 @@ extern "C" {
 static const int PORTRAIT_WIDTH  = 368;
 static const int PORTRAIT_HEIGHT = 448;
 static const gpio_num_t PIN_SD_DATA  = GPIO_NUM_3;
-static const gpio_num_t PIN_SD_CLK   = GPIO_NUM_14;
-static const gpio_num_t PIN_SD_CMD   = GPIO_NUM_15;
-static const gpio_num_t PIN_I2C_SDA  = GPIO_NUM_8;
-static const gpio_num_t PIN_I2C_SCL  = GPIO_NUM_9;
+static const gpio_num_t PIN_SD_CLK   = GPIO_NUM_2;
+static const gpio_num_t PIN_SD_CMD   = GPIO_NUM_1;
+static const gpio_num_t PIN_I2C_SDA  = GPIO_NUM_15;
+static const gpio_num_t PIN_I2C_SCL  = GPIO_NUM_14;
 static const gpio_num_t PIN_LCD_CS   = GPIO_NUM_6;
 static const gpio_num_t PIN_LCD_SCK  = GPIO_NUM_7;
 static const gpio_num_t PIN_LCD_D0   = GPIO_NUM_10;

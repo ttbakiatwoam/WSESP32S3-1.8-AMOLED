@@ -1,5 +1,6 @@
 
 #include <stdio.h>
+#include <cmath>
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_rom_sys.h"
@@ -33,6 +34,19 @@ __attribute__((constructor)) void early_global_ctor() {
 #include "pngle.h"
 #include "gifdec.h"
 #include "esp_timer.h"
+
+// Provide Arduino-compat millis() and delay() for SensorLib (ESP-IDF only)
+#ifndef ARDUINO
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+static inline unsigned long millis() {
+    return (unsigned long)(esp_timer_get_time() / 1000ULL);
+}
+static inline void delay(unsigned long ms) {
+    vTaskDelay(pdMS_TO_TICKS(ms));
+}
+#endif
+
 #include "SensorQMI8658.hpp"
 
 // Debug logging config (set in sdkconfig, default off)
@@ -44,67 +58,269 @@ __attribute__((constructor)) void early_global_ctor() {
 
 #include "display_test_shared.h"
 
-// --- BEGIN RESTORED FUNCTION PROTOTYPES, HELPERS, TASKS, ETC. ---
-// Prototypes only, no type/struct/enum or static/global variable definitions here
-static int scan_for_images(void);
-static void touch_task(void *pvParameters);
-static esp_err_t tca9554_write_reg(uint8_t reg, uint8_t value);
-static esp_err_t tca9554_read_reg(uint8_t reg, uint8_t *value);
-static esp_err_t tca9554_set_pin_direction(uint8_t pin_mask, bool output);
-static esp_err_t tca9554_set_pin_level(uint8_t pin_mask, bool high);
-static void fill_screen_color(uint16_t color);
-static inline uint16_t rgb888_to_rgb565(uint8_t r, uint8_t g, uint8_t b);
-static void calc_fit_scale(uint16_t src_w, uint16_t src_h, uint16_t *dst_w, uint16_t *dst_h, int16_t *x_off, int16_t *y_off);
-static void scale_and_draw_rgb888(uint8_t *src, uint16_t src_w, uint16_t src_h);
-static unsigned int tjpgd_input_func(JDEC *jd, uint8_t *buff, unsigned int nbyte);
-static UINT tjpgd_output_func(JDEC *jd, void *bitmap, JRECT *rect);
-static image_type_t get_image_type(const char *filename);
-static esp_err_t display_jpeg(const char *path);
-static void pngle_draw_callback(pngle_t *pngle, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *rgba);
-static void pngle_init_callback(pngle_t *pngle, uint32_t w, uint32_t h);
-static esp_err_t display_png(const char *path);
-static esp_err_t display_gif(const char *path);
-static esp_err_t display_bin(const char *path);
-static esp_err_t display_image(const char *path);
-static esp_err_t init_sd_card(void);
-static void unmount_sd_card(void);
-static void remount_sd_card(void);
-static uint8_t* decode_image_to_buffer(const char *path, uint16_t *out_w, uint16_t *out_h);
-static void preload_task(void *pvParameters);
-static void show_next_content(int *color_idx);
-void rotate_rgb888_90ccw(uint8_t *src, uint8_t *dst, uint16_t src_w, uint16_t src_h);
-// --- END RESTORED FUNCTION PROTOTYPES, HELPERS, TASKS, ETC. ---
+// Missing defines from original C app
+#define I2C_FREQ_HZ     400000
+#define PIN_TOUCH_INT   GPIO_NUM_21
 
-// --- FUNCTION IMPLEMENTATIONS (from display_test.c) ---
+// C++ globals: IMU
+static SensorQMI8658 imu;
+static int last_orientation = 0;
 
-// --- BEGIN RESTORED FUNCTION IMPLEMENTATIONS, HELPERS, TASKS, LOGIC ---
+// IMU orientation task (C++ - uses imu object)
+static void imu_orientation_task(void *pvParameters) {
+    float acc_x = 0, acc_y = 0, acc_z = 0;
+    while (1) {
+        imu.getAccelerometer(acc_x, acc_y, acc_z);
+        int orientation = 0;
+        if (fabs(acc_x) > fabs(acc_y)) {
+            orientation = (acc_x > 0) ? 1 : 3;
+        } else {
+            orientation = (acc_y > 0) ? 0 : 2;
+        }
+        if (orientation != last_orientation) {
+            last_orientation = orientation;
+            switch (orientation) {
+                case 0:
+                    esp_lcd_panel_swap_xy(panel_handle, true);
+                    esp_lcd_panel_mirror(panel_handle, false, true);
+                    break;
+                case 1:
+                    esp_lcd_panel_swap_xy(panel_handle, false);
+                    esp_lcd_panel_mirror(panel_handle, false, false);
+                    break;
+                case 2:
+                    esp_lcd_panel_swap_xy(panel_handle, true);
+                    esp_lcd_panel_mirror(panel_handle, true, false);
+                    break;
+                case 3:
+                    esp_lcd_panel_swap_xy(panel_handle, false);
+                    esp_lcd_panel_mirror(panel_handle, true, true);
+                    break;
+            }
+            ESP_LOGI("imu", "Orientation changed: %d", orientation);
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// --- C function implementations (included from display_test.c) ---
 #define TAG "display_test"
-#define SKIP_APP_MAIN
-#include "display_test.c" // For migration, include the C file directly (C++ compatible code only)
-#undef SKIP_APP_MAIN
-// --- END RESTORED FUNCTION IMPLEMENTATIONS, HELPERS, TASKS, LOGIC ---
+#include "display_test.c"
 
 // --- END FULL MIGRATION ---
 
 extern "C" void app_main(void)
 {
-    ESP_EARLY_LOGI("APP", "==== ENTERED app_main() (first line) ====");
-    ESP_EARLY_LOGI("APP", "==== app_main() after first line ====");
-    ESP_EARLY_LOGI("APP", "Checkpoint 1");
-    // Step 1: I2C init
-    ESP_EARLY_LOGI("APP", "Checkpoint 2");
-    // Step 2: IMU init
-    ESP_EARLY_LOGI("APP", "Checkpoint 3");
-    // Step 3: TCA9554 init
-    ESP_EARLY_LOGI("APP", "Checkpoint 4");
-    // Step 4: Display init
-    ESP_EARLY_LOGI("APP", "Checkpoint 5");
-    // Step 5: Touch init
-    ESP_EARLY_LOGI("APP", "Checkpoint 6");
-    // Step 6: SD card init
-    ESP_EARLY_LOGI("APP", "Checkpoint 7");
-    // Step 7: Preload/double-buffering init
-    ESP_EARLY_LOGI("APP", "Checkpoint 8");
-    // Step 8: Main loop start
-    ESP_EARLY_LOGI("APP", "Checkpoint 9");
+    ESP_LOGI(TAG, "=========================================");
+    ESP_LOGI(TAG, "  SD Card Image Display Test");
+    ESP_LOGI(TAG, "  Supports: JPEG, PNG, GIF, BIN");
+    ESP_LOGI(TAG, "  Waveshare ESP32-S3 1.8\" AMOLED");
+    ESP_LOGI(TAG, "=========================================");
+    esp_log_level_set("*", ESP_LOG_VERBOSE);
+
+    // Initialize I2C (will be configured by SensorLib's imu.begin(), 
+    // but we set up the bus first for TCA9554 and other I2C devices)
+    ESP_LOGI(TAG, "Initializing I2C...");
+    i2c_config_t i2c_conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = PIN_I2C_SDA,
+        .scl_io_num = PIN_I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master = { .clk_speed = I2C_FREQ_HZ },
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &i2c_conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, I2C_MODE_MASTER, 0, 0, 0));
+    vTaskDelay(pdMS_TO_TICKS(50)); // Allow I2C bus to stabilize
+
+    // I2C bus scan for debugging
+    ESP_LOGI(TAG, "Scanning I2C bus...");
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(cmd);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "  Found I2C device at 0x%02X", addr);
+        }
+    }
+    ESP_LOGI(TAG, "I2C scan complete.");
+
+    // TCA9554 pin masks (must init BEFORE IMU — TCA9554 controls display power)
+    #define PIN_MASK_0  (1 << 0)
+    #define PIN_MASK_1  (1 << 1)
+    #define PIN_MASK_2  (1 << 2)
+    #define PIN_MASK_7  (1 << 7)
+
+    // Configure TCA9554 I/O expander first — it controls display power/reset
+    ESP_LOGI(TAG, "Configuring TCA9554 at I2C addr 0x%02X...", TCA9554_ADDR);
+    uint8_t output_pins = PIN_MASK_0 | PIN_MASK_1 | PIN_MASK_2 | PIN_MASK_7;
+    esp_err_t tca_ret = tca9554_set_pin_direction(output_pins, true);
+    if (tca_ret != ESP_OK) {
+        ESP_LOGE(TAG, "TCA9554 set_pin_direction failed: 0x%x (%s)", tca_ret, esp_err_to_name(tca_ret));
+        ESP_LOGE(TAG, "Cannot initialize display without TCA9554, aborting");
+        return;
+    }
+    tca_ret = tca9554_set_pin_level(output_pins, false);
+    if (tca_ret != ESP_OK) {
+        ESP_LOGE(TAG, "TCA9554 set_pin_level(false) failed: 0x%x (%s)", tca_ret, esp_err_to_name(tca_ret));
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+    tca_ret = tca9554_set_pin_level(output_pins, true);
+    if (tca_ret != ESP_OK) {
+        ESP_LOGE(TAG, "TCA9554 set_pin_level(true) failed: 0x%x (%s)", tca_ret, esp_err_to_name(tca_ret));
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Initialize QMI8658 IMU (optional — won't block display if absent)
+    // Note: imu.begin() will try to re-install I2C driver (which is already installed)
+    // The SensorLib ignores the re-install error internally, so this is safe.
+    if (!imu.begin(I2C_MASTER_NUM, 0x6B, PIN_I2C_SDA, PIN_I2C_SCL)) {
+        ESP_LOGW(TAG, "QMI8658 IMU not found (may be normal if not connected)");
+    } else {
+        ESP_LOGI(TAG, "QMI8658 IMU initialized, chip ID: 0x%02X", imu.getChipID());
+        imu.configAccelerometer(SensorQMI8658::ACC_RANGE_4G, SensorQMI8658::ACC_ODR_250Hz, SensorQMI8658::LPF_MODE_0, true);
+        imu.configGyroscope(SensorQMI8658::GYR_RANGE_256DPS, SensorQMI8658::GYR_ODR_224_2Hz, SensorQMI8658::LPF_MODE_0, true);
+        xTaskCreatePinnedToCore(imu_orientation_task, "imu_orientation_task", 4096, NULL, 5, NULL, 0);
+    }
+
+    // Initialize display
+    void *qspi_ctx = NULL;
+    rm67162_qspi_config_t qspi_config = {
+        .cs_gpio = PIN_LCD_CS,
+        .sck_gpio = PIN_LCD_SCK,
+        .d0_gpio = PIN_LCD_D0,
+        .d1_gpio = PIN_LCD_D1,
+        .d2_gpio = PIN_LCD_D2,
+        .d3_gpio = PIN_LCD_D3,
+        .reset_gpio = PIN_LCD_RST,
+        .pclk_hz = 80 * 1000 * 1000,
+        .width = PORTRAIT_WIDTH,
+        .height = PORTRAIT_HEIGHT,
+        .spi_host = SPI2_HOST,
+    };
+
+    ESP_LOGI(TAG, "Initializing display...");
+    ESP_ERROR_CHECK(rm67162_qspi_init(&qspi_config, &qspi_ctx, &panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+
+    // Set display rotation (90° counter-clockwise, alternate mirror)
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
+
+    // Allocate draw buffer
+    draw_buffer = (uint16_t*)heap_caps_malloc(PORTRAIT_WIDTH * 16 * 2, MALLOC_CAP_DMA);
+    if (!draw_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate draw buffer!");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Display initialized! Forcing white fill to test display...");
+    fill_screen_color(0xFFFF);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // Touch controller
+    ESP_LOGI(TAG, "Waiting 200ms before initializing touch controller...");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_LOGI(TAG, "Initializing touch...");
+    cst816t_config_t touch_config = {
+        .i2c_port = I2C_MASTER_NUM,
+        .i2c_addr = 0x38,
+        .int_gpio = PIN_TOUCH_INT,
+        .rst_gpio = (gpio_num_t)-1,
+        .width = PORTRAIT_WIDTH,
+        .height = PORTRAIT_HEIGHT,
+        .swap_xy = false,
+        .invert_x = false,
+        .invert_y = false,
+    };
+
+    if (touch_config.rst_gpio == (gpio_num_t)-1) {
+        ESP_LOGW(TAG, "Touch config: rst_gpio is -1, hardware reset will NOT be performed.");
+    }
+
+    cst816t_handle_t touch_handle = NULL;
+    esp_err_t touch_ret = cst816t_init(&touch_config, &touch_handle);
+    if (touch_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Touch init failed (err=0x%x), continuing without touch", touch_ret);
+    } else {
+        uint8_t chip_id = 0;
+        if (cst816t_get_chip_id(touch_handle, &chip_id) == ESP_OK) {
+            ESP_LOGI(TAG, "CST816T chip ID: 0x%02X", chip_id);
+        } else {
+            ESP_LOGW(TAG, "Failed to read CST816T chip ID after init");
+        }
+    }
+
+    global_touch_handle = touch_handle;
+
+    if (touch_handle) {
+        xTaskCreatePinnedToCore(
+            touch_task, "touch_task", 8192, touch_handle, 5, NULL, 0
+        );
+        ESP_LOGI(TAG, "Touch task created");
+    }
+
+    // Initialize SD card
+    bool sd_ok = (init_sd_card() == ESP_OK);
+
+    if (sd_ok) {
+        int found = scan_for_images();
+        if (found > 0) {
+            use_images = true;
+            ESP_LOGI(TAG, "=========================================");
+            ESP_LOGI(TAG, "  Found %d images!", found);
+            ESP_LOGI(TAG, "  Tap: next image | Long press: unmount SD");
+            ESP_LOGI(TAG, "  Double-tap: remount SD card");
+            ESP_LOGI(TAG, "=========================================");
+            current_image = 0;
+            display_image(image_paths[current_image]);
+        }
+    }
+
+    if (!use_images) {
+        ESP_LOGI(TAG, "No images found on SD card");
+        fill_screen_color(0xFFE0);  // Yellow - no images
+    }
+
+    // Create mutex for double-buffering
+    preload_mutex = xSemaphoreCreateMutex();
+    if (!preload_mutex) {
+        ESP_LOGE(TAG, "Failed to create preload_mutex!");
+    }
+    xTaskCreatePinnedToCore(
+        preload_task, "preload_task", 8192, NULL, 5, NULL, 0
+    );
+    ESP_LOGI(TAG, "Preload task created");
+
+    // Main loop - handle touch events
+    while (1) {
+        touch_event_t event = pending_touch_event;
+        if (event != TOUCH_EVENT_NONE) {
+            ESP_LOGI(TAG, "Main loop: received event %d", event);
+            pending_touch_event = TOUCH_EVENT_NONE;
+            switch (event) {
+                case TOUCH_EVENT_TAP:
+                    ESP_LOGI(TAG, "Main loop: handling TAP");
+                    show_next_content(NULL);
+                    break;
+                case TOUCH_EVENT_DOUBLE_TAP:
+                    ESP_LOGI(TAG, "Main loop: handling DOUBLE TAP");
+                    remount_sd_card();
+                    break;
+                case TOUCH_EVENT_LONG_PRESS:
+                    ESP_LOGI(TAG, "Main loop: handling LONG PRESS");
+                    unmount_sd_card();
+                    break;
+                default:
+                    break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
