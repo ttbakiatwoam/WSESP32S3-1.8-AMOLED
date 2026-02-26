@@ -882,14 +882,21 @@ void fade_out_ready_cb(lv_anim_t *anim) {
     // Avoid running the per-tick fade animation for specific heavy views
     // because the opacity animation forces heavy draw work (masks/labels)
     // and can starve the LVGL tick/watchdog during the fade-in.
-    if (new_view->name && strcmp(new_view->name, "Keyboard Screen") == 0) {
+    if (new_view->name && (strcmp(new_view->name, "Keyboard Screen") == 0
+                          || strcmp(new_view->name, "Setup Wizard") == 0)) {
       if (new_view->root) {
         // make fully opaque immediately
         lv_obj_set_style_opa(new_view->root, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_opa(new_view->root, LV_OPA_COVER, 0);
         // temporarily remove rounded radii to avoid expensive mask draws
         set_radius_recursive(new_view->root, 0);
+        // Force full screen redraw
+        lv_obj_invalidate(new_view->root);
       }
-      if (status_bar) lv_obj_set_style_opa(status_bar, LV_OPA_COVER, 0);
+      if (status_bar) {
+        lv_obj_set_style_opa(status_bar, LV_OPA_COVER, 0);
+        lv_obj_invalidate(status_bar);
+      }
     } else if (new_view->name && strcmp(new_view->name, "Options Screen") == 0 && SelectedMenuType == OT_DualComm) {
       if (new_view->root) {
         // For the large Dual Comm options list, skip fade-in to keep
@@ -902,6 +909,8 @@ void fade_out_ready_cb(lv_anim_t *anim) {
       display_manager_fade_in(new_view->root);
       display_manager_fade_in(status_bar);
     }
+    // Force the active screen dirty so LVGL redraws everything
+    lv_obj_invalidate(lv_scr_act());
   }
 }
 
@@ -1674,7 +1683,6 @@ static void display_manager_switch_view_internal(View *view) {
   bsp_display_lock(0);
 #endif
   if (xSemaphoreTake(dm.mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
-    ESP_LOGI(TAG, "Switching view from %s to %s", dm.current_view ? dm.current_view->name : "NULL", view->name);
     if (dm.current_view && dm.current_view->root) {
       display_manager_previous_view = dm.current_view;
       display_manager_fade_out(dm.current_view->root, fade_out_ready_cb, view);

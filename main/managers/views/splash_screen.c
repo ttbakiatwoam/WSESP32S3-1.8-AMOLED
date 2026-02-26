@@ -66,8 +66,6 @@ static void fade_anim_cb(void *var, int32_t opacity) {
 
 static void fade_out_cb(void *var) {
   bool setup_done = settings_get_setup_complete(&G_Settings);
-  ESP_LOGW(SPLASH_TAG, "Splash animation done, setup_complete=%d, switching to %s",
-           setup_done, setup_done ? "main_menu" : "setup_wizard");
   if (!setup_done) {
     display_manager_switch_view(&setup_wizard_view);
   } else {

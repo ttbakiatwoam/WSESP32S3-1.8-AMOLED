@@ -743,7 +743,7 @@ void serial_task(void *pvParameter) {
 void serial_manager_init() {
   // UART configuration for main UART
   const uart_config_t uart_config = {
-      .baud_rate = CONFIG_CONSOLE_UART_BAUDRATE,
+      .baud_rate = 115200,
       .data_bits = UART_DATA_8_BITS,
       .parity = UART_PARITY_DISABLE,
       .stop_bits = UART_STOP_BITS_1,

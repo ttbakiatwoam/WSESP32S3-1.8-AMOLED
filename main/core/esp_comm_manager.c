@@ -1115,6 +1115,16 @@ void esp_comm_manager_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_r
     return;
 #endif
 
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+    printf("ESP Comm Manager disabled on Waveshare AMOLED (GPIO6/7 used by QSPI display)\n");
+    if (s_comm_manager->state_mutex) {
+        vSemaphoreDelete(s_comm_manager->state_mutex);
+    }
+    free(s_comm_manager);
+    s_comm_manager = NULL;
+    return;
+#endif
+
     // Don't deinitialize serial manager on TDECK to avoid UART conflicts
 #ifndef CONFIG_USE_TDECK
     if (serial_manager_get_uart_num() == (int)UART_NUM_1) {
