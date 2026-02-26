@@ -1,0 +1,3 @@
+[submodule "Repo-References/Lilygo_Waveshare_Amoled_Micropython"]
+	path = Repo-References/Lilygo_Waveshare_Amoled_Micropython
+	url = https://github.com/ttbakiatwoam/Lilygo_Waveshare_Amoled_Micropython.git
