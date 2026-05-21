@@ -584,11 +584,11 @@ int getBattery() {
     s_charge_samples[s_charge_sample_idx] = mv;
     s_charge_sample_idx = (s_charge_sample_idx + 1) % 5;
     if (s_charge_sample_idx == 0) s_charge_samples_filled = true;
-    
+
     if (s_charge_samples_filled) {
         int oldest_mv = s_charge_samples[s_charge_sample_idx];
         int trend = mv - oldest_mv;
-        
+
         if (trend > CHARGE_THRESH_MV) {
             _isCharging = true;
         } else if (trend < -CHARGE_THRESH_MV) {
@@ -600,11 +600,11 @@ int getBattery() {
     s_charge_samples[s_charge_sample_idx] = mv;
     s_charge_sample_idx = (s_charge_sample_idx + 1) % 5;
     if (s_charge_sample_idx == 0) s_charge_samples_filled = true;
-    
+
     if (s_charge_samples_filled) {
         int oldest_mv = s_charge_samples[s_charge_sample_idx];
         int trend = mv - oldest_mv;
-        
+
         // Use higher threshold for T-Deck to avoid false charging detection
         if (trend > (CHARGE_THRESH_MV * 2)) {
             _isCharging = true;
