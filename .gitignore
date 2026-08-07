@@ -40,3 +40,9 @@ Repo-References/*
 Archive.zip
 deleteme.html
 deleteme.*
+
+# macOS files
+**/.DS_Store
+*.DS_Store
+.AppleDouble
+.LSOverride
